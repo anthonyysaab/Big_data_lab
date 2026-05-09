@@ -1,0 +1,8 @@
+pyspark==3.5.1
+spark-nlp==5.3.3
+pandas
+numpy
+pyarrow
+plotly
+altair
+jupyter

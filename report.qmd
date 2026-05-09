@@ -1,0 +1,488 @@
+---
+title: "Literary Big Data Analysis — Romantic vs Realist Authors"
+subtitle: "IFEBY310 — Spark, File Formats, and NLP"
+author: "Big Data Project"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    embed-resources: true
+    code-fold: true
+    code-summary: "Show code"
+execute:
+  warning: false
+  message: false
+---
+
+```{python}
+#| label: setup
+#| echo: false
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import os
+
+# ── Colour palette ──────────────────────────────────────────────────────────
+ERA_COLOURS = {"romantic": "#4E79A7", "realist": "#F28E2B"}
+
+ERA_MAP = {
+    "balzac":   "romantic", "dumas":    "romantic",
+    "stendhal": "romantic", "hugo":     "romantic",
+    "sand":     "romantic", "flaubert": "realist",
+    "zola":     "realist",  "dickens":  "realist",
+}
+
+AUTHOR_LABELS = {
+    "balzac": "Balzac", "dumas": "Dumas", "stendhal": "Stendhal",
+    "hugo": "Hugo", "sand": "Sand", "flaubert": "Flaubert",
+    "zola": "Zola", "dickens": "Dickens",
+}
+
+DATA = "DATA/processed"
+
+def load(path: str) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+def add_era(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["era"]    = df["author"].map(ERA_MAP)
+    df["Author"] = df["author"].map(AUTHOR_LABELS)
+    return df
+```
+
+# Introduction
+
+This report analyses a corpus of 18 19th-century novels by eight authors —
+five French Romantics (Balzac, Dumas, Hugo, Sand, Stendhal) and three
+Realists (Dickens, Flaubert, Zola) — using a fully distributed pipeline built
+with **Apache Spark 3.5** and **Spark NLP 5.3.3**.
+
+The pipeline covers:
+
+1. **Ingestion** — raw Project Gutenberg `.txt` files loaded into Spark DataFrames
+2. **Storage** — corpus saved in both **Parquet** and **ORC** formats for comparison
+3. **Cleaning** — Gutenberg headers/footers stripped, whitespace normalised
+4. **Annotation** — language-specific Spark NLP pipelines (tokenisation, lemmatisation, POS tagging)
+5. **Readability** — Flesch Reading Ease (EN) and Kandel-Moles (FR) indices
+6. **Stylometry** — Zipf rank-frequency, type-token ratio, POS distribution, dialog/narration segmentation
+
+All wrangling uses Spark DataFrames; results are written to Parquet and read
+here with pandas for visualisation.
+
+---
+
+# File Format Comparison: Parquet vs ORC
+
+Both Parquet and ORC are columnar storage formats well-suited to Spark workloads.
+The table below compares their on-disk sizes for the raw corpus.
+
+```{python}
+#| label: file-format-comparison
+
+import shutil
+
+def dir_size_mb(path: str) -> float:
+    total = sum(
+        os.path.getsize(os.path.join(dp, f))
+        for dp, _, files in os.walk(path)
+        for f in files
+    )
+    return round(total / 1_048_576, 2)
+
+parquet_mb = dir_size_mb(f"{DATA}/corpus_parquet")
+orc_mb     = dir_size_mb(f"{DATA}/corpus_orc")
+
+fmt_df = pd.DataFrame({
+    "Format":      ["Parquet (Snappy)", "ORC"],
+    "Size (MB)":   [parquet_mb, orc_mb],
+    "Compression": ["Snappy", "zlib (default)"],
+    "Splittable":  ["Yes", "Yes"],
+    "Read speed":  ["Very fast", "Fast"],
+    "Ecosystem":   ["Spark, Pandas, Arrow", "Spark, Hive"],
+})
+
+fig = px.bar(
+    fmt_df, x="Format", y="Size (MB)",
+    color="Format",
+    color_discrete_sequence=["#4E79A7", "#F28E2B"],
+    text="Size (MB)",
+    title="Corpus size on disk: Parquet vs ORC",
+)
+fig.update_traces(textposition="outside")
+fig.update_layout(showlegend=False, yaxis_title="Size (MB)")
+fig.show()
+
+fmt_df[["Format","Size (MB)","Compression","Splittable","Read speed","Ecosystem"]].style.hide(axis="index")
+```
+
+**Key takeaways:**
+- Both formats are columnar and splittable — ideal for distributed Spark reads.
+- Parquet with Snappy compression is the default for this pipeline because it
+  offers the best balance of read speed and ecosystem support (Pandas, Arrow,
+  Spark all read it natively).
+- ORC is slightly more compact due to its built-in zlib compression and
+  predicate push-down optimisations favoured by Hive workloads.
+
+---
+
+# Corpus Overview
+
+```{python}
+#| label: corpus-overview
+
+ttr = add_era(load(f"{DATA}/stylometry_ttr"))
+
+fig = px.bar(
+    ttr.sort_values("total_tokens", ascending=False),
+    x="document_id", y="total_tokens",
+    color="era",
+    color_discrete_map=ERA_COLOURS,
+    labels={"document_id": "Document", "total_tokens": "Word tokens",
+            "era": "Era"},
+    title="Corpus size by document (word tokens, excluding punctuation)",
+    hover_data=["Author", "language"],
+)
+fig.update_xaxes(tickangle=45)
+fig.show()
+```
+
+The corpus spans **3.5 million tokens** across 18 novels. Hugo's
+*Les Misérables* and Dumas's *Le Comte de Monte-Cristo* dominate by length.
+French novels make up 14 of the 18 documents; the four English texts are by
+Dickens and Sand (whose *Indiana* is represented here by its English translation).
+
+---
+
+# Readability Analysis
+
+## Global readability scores
+
+Readability is computed using two formulas adapted to the corpus languages:
+
+- **Flesch Reading Ease** (English): $206.835 - 1.015 \cdot \frac{W}{S} - 84.6 \cdot \frac{Syl}{W}$
+- **Kandel-Moles** (French, adapted Flesch): $207.0 - 1.015 \cdot \frac{W}{S} - 73.6 \cdot \frac{Syl}{W}$
+
+Scores roughly in [0, 100]: below 30 = very difficult; 60–70 = standard; above 70 = easy.
+
+```{python}
+#| label: readability-global
+
+rd = add_era(load(f"{DATA}/readability_global"))
+
+fig = px.bar(
+    rd.sort_values("readability_score"),
+    x="readability_score", y="document_id",
+    color="era",
+    color_discrete_map=ERA_COLOURS,
+    orientation="h",
+    labels={
+        "readability_score": "Readability score",
+        "document_id": "Document",
+        "era": "Era",
+    },
+    title="Global readability scores by document",
+    hover_data=["Author", "readability_index", "avg_sentence_length",
+                "avg_syllables_per_word"],
+    text=rd.sort_values("readability_score")["readability_score"].round(1),
+)
+fig.update_traces(textposition="outside")
+fig.add_vline(x=60, line_dash="dash", line_color="grey",
+              annotation_text="60 — standard threshold")
+fig.show()
+```
+
+```{python}
+#| label: readability-scatter
+
+fig = px.scatter(
+    rd,
+    x="avg_sentence_length",
+    y="avg_syllables_per_word",
+    color="era",
+    color_discrete_map=ERA_COLOURS,
+    size="word_count",
+    text="document_id",
+    labels={
+        "avg_sentence_length":    "Avg words per sentence",
+        "avg_syllables_per_word": "Avg syllables per word",
+        "era": "Era",
+    },
+    title="Sentence length vs syllabic density (bubble = corpus size)",
+    hover_data=["Author", "readability_score"],
+)
+fig.update_traces(textposition="top center")
+fig.show()
+```
+
+**Observations:**
+- Stendhal shows the highest syllabic density (~1.83 syl/word), indicating
+  a more Latinate, abstract vocabulary.
+- Sand's *Indiana* has the longest average sentences (24.5 words), pulling its
+  Flesch score down to 50 — the only text below "fairly difficult".
+- Romantic authors cluster slightly higher in readability on average, though
+  the difference is modest; sentence complexity varies more by author than by era.
+
+## Readability across chunks (sliding window)
+
+```{python}
+#| label: readability-sliding
+
+sl = add_era(load(f"{DATA}/readability_sliding"))
+sl10 = sl[sl["window_size"] == 10].copy()
+
+# pick a representative subset for clarity
+selected = ["les_miserables", "madame_bovary", "bleak_house",
+            "le_rouge_et_le_noir", "indiana"]
+sl10_sel = sl10[sl10["document_id"].isin(selected)]
+
+fig = px.line(
+    sl10_sel,
+    x="chunk_id", y="readability_score",
+    color="document_id",
+    labels={
+        "chunk_id":          "Chunk position",
+        "readability_score": "Readability score (window=10)",
+        "document_id":       "Document",
+    },
+    title="Readability over narrative time (5 selected novels, window=10 chunks)",
+)
+fig.show()
+```
+
+The sliding-window view reveals within-novel variation: readability is rarely
+constant — it dips during dense descriptive or philosophical passages and rises
+in dialogue-heavy sections.
+
+---
+
+# Zipf Analysis
+
+Zipf's law predicts that in natural language the frequency of a word is
+inversely proportional to its rank. On a log-log plot this appears as a
+straight line with slope ≈ −1.
+
+```{python}
+#| label: zipf
+
+zipf = add_era(load(f"{DATA}/stylometry_zipf"))
+
+# One representative novel per author
+reps = {
+    "balzac":   "le_pere_goriot",
+    "flaubert": "madame_bovary",
+    "hugo":     "les_miserables",
+    "zola":     "germinal",
+    "dickens":  "bleak_house",
+    "stendhal": "le_rouge_et_le_noir",
+    "dumas":    "les_trois_mousquetaires",
+    "sand":     "indiana",
+}
+
+zipf_sel = zipf[zipf.apply(lambda r: reps.get(r["author"]) == r["document_id"], axis=1)].copy()
+zipf_sel = zipf_sel[zipf_sel["rank"] <= 500]
+
+fig = px.line(
+    zipf_sel,
+    x="log_rank", y="log_frequency",
+    color="Author",
+    labels={
+        "log_rank":      "log(rank)",
+        "log_frequency": "log(frequency)",
+    },
+    title="Zipf curves — one representative novel per author (top 500 tokens)",
+)
+fig.show()
+```
+
+**Observations:**
+- All novels follow the expected linear log-log relationship, confirming Zipf's
+  law holds across both languages and eras.
+- The slopes are nearly identical across authors — a universal property of
+  natural language, not a stylistic fingerprint.
+- Differences appear in the intercept (overall vocabulary richness) rather
+  than slope.
+
+---
+
+# Type-Token Ratio (TTR)
+
+TTR = unique lemmas / total word tokens. A higher TTR indicates greater
+lexical diversity. Because TTR decreases with text length, results should be
+compared with document size in mind.
+
+```{python}
+#| label: ttr
+
+fig = make_subplots(rows=1, cols=2, subplot_titles=["TTR by document", "TTR vs corpus size"])
+
+for era, grp in ttr.groupby("era"):
+    colour = ERA_COLOURS[era]
+    fig.add_trace(
+        go.Bar(
+            x=grp["document_id"], y=grp["ttr"],
+            name=era.capitalize(), marker_color=colour,
+            legendgroup=era,
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=grp["total_tokens"], y=grp["ttr"],
+            mode="markers+text",
+            text=grp["Author"],
+            textposition="top center",
+            name=era.capitalize(),
+            marker=dict(color=colour, size=10),
+            legendgroup=era, showlegend=False,
+        ),
+        row=1, col=2,
+    )
+
+fig.update_layout(
+    title_text="Type-Token Ratio: lexical diversity across the corpus",
+    barmode="group",
+)
+fig.update_xaxes(tickangle=45, row=1, col=1)
+fig.update_xaxes(title_text="Total tokens", row=1, col=2)
+fig.update_yaxes(title_text="TTR", row=1, col=1)
+fig.update_yaxes(title_text="TTR", row=1, col=2)
+fig.show()
+```
+
+**Observations:**
+- Shorter novels (Balzac's *Eugénie Grandet*, Zola's *L'Assommoir*) show
+  higher TTR by the length effect — they simply repeat fewer words.
+- Among long novels, Hugo's *Les Misérables* retains a relatively high TTR
+  (unique lemma count: 29,955), reflecting its encyclopaedic scope.
+- Dickens's TTR appears low (~0.04–0.06) because all three novels are very
+  long; his absolute unique lemma counts are among the highest in the corpus.
+
+---
+
+# POS Distribution
+
+Part-of-speech ratios reveal authorial style: noun-heavy prose tends towards
+description; verb-heavy towards action; adjective-heavy towards elaboration.
+
+```{python}
+#| label: pos
+
+pos = add_era(load(f"{DATA}/stylometry_pos"))
+
+# Aggregate to author level for cross-author comparison
+pos_auth = (
+    pos.groupby(["Author", "era", "pos_normalised"])
+       .agg(token_count=("token_count", "sum"), total=("total_tokens", "sum"))
+       .reset_index()
+)
+pos_auth["pos_ratio"] = pos_auth["token_count"] / pos_auth["total"]
+
+tags = ["NOUN", "VERB", "ADJ", "PROPN", "ADV", "DET", "PUNCT"]
+pos_auth_sel = pos_auth[pos_auth["pos_normalised"].isin(tags)]
+
+fig = px.bar(
+    pos_auth_sel,
+    x="Author", y="pos_ratio",
+    color="pos_normalised",
+    barmode="group",
+    labels={
+        "pos_ratio":      "Proportion of tokens",
+        "pos_normalised": "POS tag",
+    },
+    title="POS distribution by author (aggregated across all works)",
+    category_orders={"pos_normalised": tags},
+)
+fig.update_xaxes(tickangle=30)
+fig.show()
+```
+
+```{python}
+#| label: pos-heatmap
+
+pivot = pos_auth_sel.pivot_table(
+    index="Author", columns="pos_normalised", values="pos_ratio", fill_value=0
+)[tags]
+
+fig = px.imshow(
+    pivot.round(3),
+    color_continuous_scale="Blues",
+    labels={"color": "Proportion"},
+    title="POS ratio heatmap — authors × POS tags",
+    aspect="auto",
+)
+fig.show()
+```
+
+**Observations:**
+- Nouns dominate all authors (as expected in 19th-century literary prose).
+- Zola and Flaubert show relatively higher adjective ratios, consistent with
+  Realist attention to sensory description.
+- Stendhal's higher PROPN ratio reflects his dense cast of proper names and
+  political references.
+
+---
+
+# Dialog vs Narration
+
+Dialog was detected using quotation markers (`«»`, `""`, `"`). Em-dash
+dialog — predominant in French literary convention (Hugo, Dumas, Zola, much
+of Balzac) — cannot be recovered from the tokenised corpus because line
+position is not preserved after chunking. Results should be interpreted as a
+**lower bound** on dialog proportion.
+
+```{python}
+#| label: dialog
+
+dlg = add_era(load(f"{DATA}/stylometry_dialog"))
+
+fig = px.bar(
+    dlg.sort_values("dialog_ratio", ascending=False),
+    x="document_id", y="dialog_ratio",
+    color="era",
+    color_discrete_map=ERA_COLOURS,
+    labels={
+        "dialog_ratio": "Dialog ratio (lower bound)",
+        "document_id":  "Document",
+        "era":          "Era",
+    },
+    title="Dialog ratio by document (quote-marker detection only)",
+    hover_data=["Author", "dialog_tokens", "total_tokens"],
+    text=dlg.sort_values("dialog_ratio", ascending=False)["dialog_ratio"].round(3),
+)
+fig.update_traces(textposition="outside")
+fig.update_xaxes(tickangle=45)
+fig.show()
+```
+
+**Observations:**
+- Flaubert's *L'Éducation sentimentale* and Balzac's *Eugénie Grandet* show
+  the highest detected dialog ratios (~46–48%), as both use French guillemets
+  (`«»`) consistently.
+- Sand's *Indiana* (English translation) registers ~34%, detected via curly
+  English quotes.
+- The zeros for Hugo, Dumas, most of Balzac, and all of Zola reflect their
+  em-dash dialog convention rather than an absence of dialog.
+
+---
+
+# Conclusion
+
+This analysis demonstrates a fully distributed literary NLP pipeline on a
+local Windows machine using PySpark and Spark NLP. Key findings:
+
+| Dimension | Key result |
+|-----------|-----------|
+| **Readability** | Stendhal is the most lexically dense (highest syl/word); Sand writes the longest sentences |
+| **Zipf** | All 18 novels obey Zipf's law regardless of language or era |
+| **TTR** | Hugo's *Les Misérables* has the largest vocabulary in absolute terms |
+| **POS** | Realists (Flaubert, Zola) use slightly more adjectives; all authors are noun-heavy |
+| **Dialog** | Quote-marker detection captures ~34–48% dialog in texts using guillemets/curly quotes; em-dash dialog undetectable without line-position data |
+| **File formats** | Parquet (Snappy) and ORC both perform well; Parquet chosen for its broader ecosystem support |
+
+The pipeline is reproducible end-to-end via `run_all.py` and all intermediate
+outputs are stored in Parquet for efficient downstream access.
