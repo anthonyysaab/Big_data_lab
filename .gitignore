@@ -1,11 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
-.spark-warehouse/
 .ipynb_checkpoints/
-
-DATA/raw/
-DATA/processed/
-
-*.log
-.DS_Store
+.spark-warehouse/
+metastore_db/
+derby.log
