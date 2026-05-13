@@ -4,14 +4,14 @@ src/stylometry.py
 Stylometric analysis of the literary corpus.
 
 Computes:
-  1. Zipf data        — token frequency rank vs frequency per document
-  2. Dialog/narration — per-token and per-document dialog ratio
+  1. Zipf data         — token frequency rank vs frequency per document
+  2. Dialog/narration — per-document dialog ratio
   3. Type-token ratio — unique lemmas / total tokens per document
   4. POS distribution — proportion of NOUN/VERB/ADJ/PROPN per author & document
 
 Input
 -----
-Annotated token table:  DATA/processed/corpus_annotated
+Annotated token table: DATA/processed/corpus_annotated
     columns:
         document_id, language, chunk_id, token_id,
         token, lemma, pos, ner, author
@@ -40,7 +40,7 @@ def _require_columns(df: DataFrame, required_cols: set[str], context: str) -> No
     Fail early with a clear error if an input DataFrame is missing columns.
 
     This is especially important for stylometry because dialog segmentation
-    depends on token order.  Older annotated corpora do not contain token_id
+    depends on token order. Older annotated corpora do not contain token_id
     and must be regenerated with the updated src/annotate.py.
     """
     missing = required_cols - set(df.columns)
@@ -60,7 +60,7 @@ def compute_zipf(token_df: DataFrame) -> DataFrame:
     Compute Zipf rank-frequency data per document.
 
     For each (author, document_id), count how many times each token appears,
-    then rank tokens by descending frequency. The Zipf law predicts:
+    then rank tokens by descending frequency. Zipf's law predicts:
         frequency ∝ 1 / rank
 
     Output columns:
@@ -73,9 +73,6 @@ def compute_zipf(token_df: DataFrame) -> DataFrame:
         "compute_zipf",
     )
 
-    # Count token occurrences per document — lowercase for frequency counting.
-    # Punctuation/symbol/unknown tags are excluded so that the curve reflects
-    # lexical frequency rather than punctuation habits.
     token_counts = (
         token_df
         .filter(~F.col("pos").isin("PUNCT", "SYM", "X"))
@@ -84,7 +81,6 @@ def compute_zipf(token_df: DataFrame) -> DataFrame:
         .agg(F.count("*").cast("long").alias("frequency"))
     )
 
-    # Rank within each document by descending frequency.
     doc_window = (
         Window
         .partitionBy("author", "document_id")
@@ -105,33 +101,51 @@ def compute_zipf(token_df: DataFrame) -> DataFrame:
 # 2. Dialog vs narration segmentation
 # ---------------------------------------------------------------------------
 
+_QUOTE_OPEN_TOKENS = {"«", "“"}
+_QUOTE_CLOSE_TOKENS = {"»", "”"}
+_QUOTE_TOGGLE_TOKENS = {'"'}
+
+# Dialogue forms observed in the current corpus:
+#   "Text"
+#   “Text”
+#   «Text»
+#   -- Text
+#   --Text
+#   :-- Text
+#   — Text / – Text / ― Text
+_DASH_DIALOG_TOKENS = {"—", "–", "-", "―", "--", ":--", ":—", ":–", ":―"}
+
+_SENTENCE_END_TOKENS = {".", "!", "?", "…", "?!", "!?"}
+_DASH_START_BOUNDARY_TOKENS = _SENTENCE_END_TOKENS | {":", ";", "»", "”", '"'}
+
+_WORDLIKE_RE = r"[A-Za-zÀ-ÖØ-öø-ÿ]"
+_DASH_PREFIX_RE = r"^[:;]?(?:--|—|–|-|―)"
+_DASH_PREFIX_WORD_RE = r"^[:;]?(?:--|—|–|-|―)[A-Za-zÀ-ÖØ-öø-ÿ]"
+_COLON_DASH_RE = r"^[:;](?:--|—|–|-|―)"
+
+
 def compute_dialog(token_df: DataFrame) -> DataFrame:
     """
-    Label each token as 'dialog' or 'narration' based on quotation context.
-
-    Required ordering columns:
-    - chunk_id: position of the text chunk inside the document
-    - token_id: position of the token inside the chunk
+    Label each token as 'dialog' or 'narration'.
 
     Strategy:
-    - Directional quotation marks:
-        « opens dialog
-        » closes dialog
-        “ opens dialog
-        ” closes dialog
+    1. Quotation-marker detection:
+       - « and “ open dialog
+       - » and ” close dialog
+       - " toggles dialog state
 
-    - Straight double quotes:
-        " toggles dialog state on/off
+    2. Dash-dialog detection:
+       - handles -- Text
+       - handles --Text, e.g. --J'aime
+       - handles :-- Text
+       - handles em/en/horizontal dash variants: —, –, ―
+       - handles cases where -- is tokenised as two separate - tokens
 
     Important:
-    - Apostrophes and single quotes are intentionally ignored. In French and
-      English literary text, apostrophes often mark elision or contraction
-      rather than dialogue, e.g. l'homme, don't, it's.
-    - Dialogue introduced only by dashes is not fully recoverable from the
-      current annotated token table, because line-start position is not
-      preserved after chunking.
-    - State is reset at chunk boundaries. Chunks are short enough that this is
-      acceptable for a stylometric approximation.
+    - Mid-word double hyphens such as eyesight--a or think.--For are not
+      treated as dialogue openers because they do not start the token.
+    - True line-start dialogue should ideally be detected before tokenisation.
+      This token-level method is a conservative approximation.
 
     Output columns:
         author, document_id, language, chunk_id, token_id,
@@ -153,16 +167,41 @@ def compute_dialog(token_df: DataFrame) -> DataFrame:
         "compute_dialog",
     )
 
-    open_quotes = {"«", "“"}
-    close_quotes = {"»", "”"}
-    toggle_quotes = {'"'}
+    open_set = F.array(*[F.lit(q) for q in sorted(_QUOTE_OPEN_TOKENS)])
+    close_set = F.array(*[F.lit(q) for q in sorted(_QUOTE_CLOSE_TOKENS)])
+    toggle_set = F.array(*[F.lit(q) for q in sorted(_QUOTE_TOGGLE_TOKENS)])
+    dash_set = F.array(*[F.lit(q) for q in sorted(_DASH_DIALOG_TOKENS)])
+    quote_any = sorted(_QUOTE_OPEN_TOKENS | _QUOTE_CLOSE_TOKENS | _QUOTE_TOGGLE_TOKENS)
 
-    open_set = F.array(*[F.lit(q) for q in sorted(open_quotes)])
-    close_set = F.array(*[F.lit(q) for q in sorted(close_quotes)])
-    toggle_set = F.array(*[F.lit(q) for q in sorted(toggle_quotes)])
+    doc_order_window = (
+        Window
+        .partitionBy("author", "document_id")
+        .orderBy("chunk_id", "token_id")
+    )
+
+    quote_window = (
+        Window
+        .partitionBy("author", "document_id", "chunk_id")
+        .orderBy("token_id")
+        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    )
+
+    dash_window = (
+        Window
+        .partitionBy("author", "document_id")
+        .orderBy("chunk_id", "token_id")
+        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    )
 
     labeled = (
         token_df
+        .withColumn("_doc_pos", F.row_number().over(doc_order_window).cast("long"))
+        .withColumn("_prev_token", F.lag("token").over(doc_order_window))
+        .withColumn("_next_token", F.lead("token").over(doc_order_window))
+        .withColumn("_next2_token", F.lead("token", 2).over(doc_order_window))
+        .withColumn("_next3_token", F.lead("token", 3).over(doc_order_window))
+
+        # Quotation markers.
         .withColumn(
             "_is_open_quote",
             F.when(F.array_contains(open_set, F.col("token")), F.lit(1)).otherwise(F.lit(0)),
@@ -179,20 +218,118 @@ def compute_dialog(token_df: DataFrame) -> DataFrame:
             "_quote_delta",
             F.col("_is_open_quote") - F.col("_is_close_quote"),
         )
-    )
 
-    token_window = (
-        Window
-        .partitionBy("author", "document_id", "chunk_id")
-        .orderBy("token_id")
-        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+        # Dash/dialog-marker features.
+        .withColumn(
+            "_is_dash_token",
+            F.when(F.array_contains(dash_set, F.col("token")), F.lit(1)).otherwise(F.lit(0)),
+        )
+        .withColumn(
+            "_prev_is_boundary",
+            (
+                F.col("_prev_token").isNull()
+                | F.col("_prev_token").isin(*sorted(_DASH_START_BOUNDARY_TOKENS))
+            ),
+        )
+        .withColumn(
+            "_next_is_word",
+            F.coalesce(F.col("_next_token").rlike(_WORDLIKE_RE), F.lit(False)),
+        )
+        .withColumn(
+            "_next2_is_word",
+            F.coalesce(F.col("_next2_token").rlike(_WORDLIKE_RE), F.lit(False)),
+        )
+        .withColumn(
+            "_next3_is_word",
+            F.coalesce(F.col("_next3_token").rlike(_WORDLIKE_RE), F.lit(False)),
+        )
+        .withColumn(
+            "_next_is_quote",
+            F.coalesce(F.col("_next_token").isin(*quote_any), F.lit(False)),
+        )
+        .withColumn(
+            "_next2_is_quote",
+            F.coalesce(F.col("_next2_token").isin(*quote_any), F.lit(False)),
+        )
+        .withColumn(
+            "_token_starts_dash",
+            F.coalesce(F.col("token").rlike(_DASH_PREFIX_RE), F.lit(False)),
+        )
+        .withColumn(
+            "_token_starts_dash_word",
+            F.coalesce(F.col("token").rlike(_DASH_PREFIX_WORD_RE), F.lit(False)),
+        )
+        .withColumn(
+            "_token_starts_colon_dash",
+            F.coalesce(F.col("token").rlike(_COLON_DASH_RE), F.lit(False)),
+        )
+
+        # Examples covered:
+        #   -- "Shaving..."
+        #   :-- The senses...
+        #   --J'aime l'ombre...
+        #   -- Ce temps-là...
+        #   - - J'aime...  if -- was split into two tokens
+        .withColumn(
+            "_is_single_dash_start",
+            (
+                (F.col("_is_dash_token") == 1)
+                & (
+                    F.col("_next_is_word")
+                    | (F.col("_next_is_quote") & F.col("_next2_is_word"))
+                )
+            ),
+        )
+        .withColumn(
+            "_is_split_double_hyphen_start",
+            (
+                (F.col("token") == "-")
+                & (F.col("_next_token") == "-")
+                & (
+                    F.col("_next2_is_word")
+                    | (F.col("_next2_is_quote") & F.col("_next3_is_word"))
+                )
+            ),
+        )
+        .withColumn(
+            "_is_dash_dialog_start",
+            F.when(
+                (
+                    F.col("_prev_is_boundary")
+                    | F.col("_token_starts_colon_dash")
+                )
+                & (
+                    F.col("_is_single_dash_start")
+                    | F.col("_is_split_double_hyphen_start")
+                    | F.col("_token_starts_dash_word")
+                ),
+                F.lit(1),
+            ).otherwise(F.lit(0)),
+        )
+        .withColumn(
+            "_is_sentence_end",
+            F.when(F.col("token").isin(*sorted(_SENTENCE_END_TOKENS)), F.lit(1)).otherwise(F.lit(0)),
+        )
+        .withColumn(
+            "_dash_start_pos",
+            F.when(F.col("_is_dash_dialog_start") == 1, F.col("_doc_pos"))
+             .otherwise(F.lit(None).cast("long")),
+        )
+        .withColumn(
+            "_sentence_end_pos",
+            F.when(F.col("_is_sentence_end") == 1, F.col("_doc_pos"))
+             .otherwise(F.lit(None).cast("long")),
+        )
     )
 
     segmented = (
         labeled
+
+        # Quote state, reset at chunk boundaries so one broken quote does not
+        # contaminate a full document.
         .withColumn(
             "_directional_after",
-            F.sum("_quote_delta").over(token_window),
+            F.sum("_quote_delta").over(quote_window),
         )
         .withColumn(
             "_directional_before",
@@ -200,7 +337,7 @@ def compute_dialog(token_df: DataFrame) -> DataFrame:
         )
         .withColumn(
             "_toggle_after",
-            F.sum("_is_toggle_quote").over(token_window),
+            F.sum("_is_toggle_quote").over(quote_window),
         )
         .withColumn(
             "_toggle_before",
@@ -218,24 +355,67 @@ def compute_dialog(token_df: DataFrame) -> DataFrame:
                 F.pmod(F.col("_toggle_after"), F.lit(2)) == 1
             ),
         )
+
+        # Dash-dialog state.
+        # A dash-start opens a short dialogue span until the next sentence-final
+        # punctuation. This avoids turning whole chapters into dialogue.
+        .withColumn(
+            "_last_dash_start_pos",
+            F.coalesce(F.max("_dash_start_pos").over(dash_window), F.lit(-1)),
+        )
+        .withColumn(
+            "_last_sentence_end_pos",
+            F.coalesce(F.max("_sentence_end_pos").over(dash_window), F.lit(-1)),
+        )
+        .withColumn(
+            "_inside_dash_dialog",
+            F.col("_last_dash_start_pos") > F.col("_last_sentence_end_pos"),
+        )
+
         .withColumn(
             "segment",
             F.when(
-                F.col("_inside_directional_quote") | F.col("_inside_toggle_quote"),
+                F.col("_inside_directional_quote")
+                | F.col("_inside_toggle_quote")
+                | F.col("_inside_dash_dialog"),
                 F.lit("dialog"),
             ).otherwise(F.lit("narration")),
         )
         .drop(
+            "_doc_pos",
+            "_prev_token",
+            "_next_token",
+            "_next2_token",
+            "_next3_token",
             "_is_open_quote",
             "_is_close_quote",
             "_is_toggle_quote",
             "_quote_delta",
+            "_is_dash_token",
+            "_prev_is_boundary",
+            "_next_is_word",
+            "_next2_is_word",
+            "_next3_is_word",
+            "_next_is_quote",
+            "_next2_is_quote",
+            "_token_starts_dash",
+            "_token_starts_dash_word",
+            "_token_starts_colon_dash",
+            "_is_single_dash_start",
+            "_is_split_double_hyphen_start",
+            "_is_dash_dialog_start",
+            "_is_sentence_end",
+            "_dash_start_pos",
+            "_sentence_end_pos",
             "_directional_after",
             "_directional_before",
             "_toggle_after",
             "_toggle_before",
             "_inside_directional_quote",
             "_inside_toggle_quote",
+            "_last_dash_start_pos",
+            "_last_sentence_end_pos",
+            "_inside_dash_dialog",
         )
     )
 
@@ -330,19 +510,14 @@ def compute_ttr(token_df: DataFrame) -> DataFrame:
 # 4. POS distribution
 # ---------------------------------------------------------------------------
 
-# POS tags of interest — covers both UD (FR) and PTB (EN) tagsets.
 _POS_OF_INTEREST = {
-    # UD tags: mostly French output
     "NOUN", "VERB", "ADJ", "PROPN", "ADV", "DET", "PUNCT",
-
-    # PTB tags: mostly English output, mapped below to UD-style labels
     "NN", "NNS", "NNP", "NNPS",
     "VB", "VBD", "VBG", "VBN", "VBP", "VBZ",
     "JJ", "JJR", "JJS",
     "RB", "RBR", "RBS",
 }
 
-# Normalise PTB tags to UD-style labels for cross-language comparison.
 _PTB_TO_UD = {
     "NN": "NOUN",
     "NNS": "NOUN",
@@ -367,7 +542,7 @@ def _normalise_pos_udf():
     """
     Return a small UDF that maps English PTB tags to UD-style labels.
 
-    French Spark NLP already uses UD-style POS tags.  English Spark NLP uses
+    French Spark NLP already uses UD-style POS tags. English Spark NLP uses
     Penn Treebank tags, so we normalize only the PTB subset needed for plots.
     """
     mapping = dict(_PTB_TO_UD)

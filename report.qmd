@@ -1,7 +1,9 @@
 ---
 title: "Literary Big Data Analysis — Romantic vs Realist Authors"
 subtitle: "IFEBY310 — Spark, File Formats, and NLP"
-author: "Anthony Saab"
+author:
+  - Anthony Saab
+  - Malcom Lunette
 date: today
 format:
   html:
@@ -21,11 +23,14 @@ execute:
 #| label: setup
 #| echo: false
 
+import os
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import os
+from IPython.display import Image, Markdown, display
 
 # ── Colour palette ──────────────────────────────────────────────────────────
 ERA_COLOURS = {"romantic": "#4E79A7", "realist": "#F28E2B"}
@@ -57,36 +62,143 @@ def add_era(df: pd.DataFrame) -> pd.DataFrame:
 
 # Introduction
 
-This report analyses a corpus of 18 19th-century novels by eight authors —
-five French Romantics (Balzac, Dumas, Hugo, Sand, Stendhal) and three
-Realists (Dickens, Flaubert, Zola) — using a fully distributed pipeline built
-with **Apache Spark 3.5** and **Spark NLP 5.3.3**.
+This report analyses a corpus of 18 19th-century novels by eight authors using a **Spark-based** pipeline built with **Apache Spark 3.5.1** and **Spark NLP 5.3.3**. The corpus mainly compares Romantic and Realist prose. In the current dataset, most texts are English translations. The French-language subset consists of Stendhal's two novels and Zola's *Nana*. Zola is therefore treated as a mixed-language author: *Germinal* and *L'Assommoir* are English translations, while *Nana* is French.
+
+**Repository:** <https://github.com/anthonyysaab/Big_data_lab>
 
 The pipeline covers:
 
 1. **Ingestion** — raw Project Gutenberg `.txt` files loaded into Spark DataFrames
-2. **Storage** — corpus saved in both **Parquet** and **ORC** formats for comparison
+2. **Storage** — corpus saved in **Parquet**, **ORC**, **CSV**, and **JSON** formats for comparison
 3. **Cleaning** — Gutenberg headers/footers stripped, whitespace normalised
-4. **Annotation** — language-specific Spark NLP pipelines (tokenisation, lemmatisation, POS tagging)
-5. **Readability** — Flesch Reading Ease (EN) and Kandel-Moles (FR) indices
-6. **Stylometry** — Zipf rank-frequency, type-token ratio, POS distribution, dialog/narration segmentation
+4. **Annotation** — language-specific Spark NLP pipelines for tokenisation, lemmatisation, and POS tagging
+5. **Readability** — Flesch-Kincaid Grade Level (EN) and Kandel-Moles (FR)
+6. **Stylometry** — Zipf rank-frequency, type-token ratio, POS distribution, and dialog/narration segmentation
+7. **Spark profiling** — Spark UI enabled locally to inspect jobs, stages, task counts, and execution timing
+8. **Spark performance reflection** — partitioning, shuffles, caching, durable checkpoints, and file-format choices
 
-All wrangling uses Spark DataFrames; results are written to Parquet and read
-here with pandas for visualisation.
+All expensive wrangling uses Spark DataFrames. The final report loads reduced Parquet outputs with Pandas only for visualisation.
 
 ---
 
-# File Format Comparison: Parquet vs ORC
+# Data, Loading, and Transformation Pipeline
 
-Both Parquet and ORC are columnar storage formats well-suited to Spark workloads.
-The table below compares their on-disk sizes for the raw corpus.
+The corpus is stored locally under the following structure:
+
+```text
+DATA/raw/{author}/{title}.txt
+```
+
+Each subfolder corresponds to one author, and each `.txt` file corresponds to one literary work. The ingestion script loads these files into a Spark DataFrame with the following schema:
+
+| Column | Meaning |
+|---|---|
+| `raw_text` | Full original text loaded from the `.txt` file |
+| `source_path` | Absolute path of the source file |
+| `author` | Author folder name |
+| `filename` | Original filename |
+| `document_id` | Filename without extension |
+| `language` | Language code used for NLP model selection |
+| `era` | Literary period label used for comparison |
+
+The project uses explicit metadata maps in `src/ingest.py`. Most language assignments are author-level, but document-level overrides are used when an author has mixed-language files. This is necessary for Zola: `germinal` and `lassommoir` are English translations, while `nana` is French.
+
+The final corpus contains the following authors and works:
+
+| Author | Work identifier | Language | Era label |
+|---|---|---|---|
+| Balzac | `eugenie_grandet`, `le_pere_goriot`, `la_cousine_bette` | English translations | Romantic |
+| Dumas | `le_comte_de_monte_cristo`, `les_trois_mousquetaires` | English translations | Romantic |
+| Stendhal | `la_chartreuse_de_parme`, `le_rouge_et_le_noir` | French | Romantic |
+| Hugo | `les_miserables`, `notre_dame_de_paris` | English translations | Romantic |
+| Sand | `indiana` | English translation | Romantic |
+| Flaubert | `madame_bovary`, `leducation_sentimentale` | English translations | Realist |
+| Zola | `germinal`, `lassommoir`, `nana` | Mixed: English translations + French `nana` | Realist |
+| Dickens | `bleak_house`, `great_expectations`, `oliver_twist` | English | Realist |
+
+This corpus is large enough to create a realistic Spark workflow because annotation expands 18 document-level rows into several million token-level rows.
+
+The transformation pipeline is controlled by `run_all.py` and follows this order:
+
+1. Load raw `.txt` files from `DATA/raw`.
+2. Save the ingested Spark corpus to Parquet and ORC.
+3. Read the Parquet version back into Spark.
+4. Strip Project Gutenberg headers and footers.
+5. Normalize whitespace and compute document-level statistics.
+6. Chunk long novels before NLP annotation.
+7. Annotate chunks with Spark NLP.
+8. Save token-level annotations to partitioned Parquet.
+9. Compute readability and stylometric outputs.
+10. Export CSV and JSON versions of the ingested corpus for file-format comparison.
+11. Load reduced Parquet outputs in Quarto for visualisation.
+
+This division is important: Spark handles the expensive corpus transformations, while the final Quarto report only loads already-reduced analytical tables.
+
+---
+
+# Spark NLP Annotation Pipeline
+
+The annotation stage is the most computationally expensive part of the project. Each cleaned novel is first split into chunks of approximately 4,000 characters. This avoids sending entire novels as single rows through Spark NLP, which is unstable on a local Windows machine and can create very large JVM objects.
+
+The annotation script builds separate Spark NLP pipelines for French and English. In the final run, 3 documents were processed with the French pipeline and 15 documents were processed with the English pipeline.
+
+Both pipelines follow the same structure:
+
+| Stage | Role |
+|---|---|
+| `DocumentAssembler` | Converts cleaned text into Spark NLP document annotations |
+| `SentenceDetector` | Splits the text into sentences |
+| `Tokenizer` | Splits sentences into tokens |
+| `LemmatizerModel` | Produces lemmas for lexical analysis |
+| `PerceptronModel` | Produces POS tags |
+| `Finisher` | Converts Spark NLP annotations into regular Spark array columns |
+
+The French pipeline uses:
+
+```text
+lemma_spacylookup/fr
+pos_ud_gsd/fr
+```
+
+The English pipeline uses:
+
+```text
+lemma_antbnc/en
+pos_anc/en
+```
+
+Despite the model name `lemma_spacylookup`, annotation is executed through Spark NLP. No separate spaCy annotation pipeline was run in this project.
+
+After annotation, arrays of tokens, lemmas, and POS tags are exploded into one row per token. A `token_id` column is added during this step. This is necessary because Spark does not guarantee row order after transformations or Parquet writes. The pair `(chunk_id, token_id)` preserves textual order inside each document and is later used for dialog/narration segmentation.
+
+The final annotated corpus contains the following main columns:
+
+| Column | Meaning |
+|---|---|
+| `author` | Author partition |
+| `document_id` | Work identifier |
+| `language` | French or English |
+| `chunk_id` | Position of the chunk inside the document |
+| `token_id` | Position of the token inside the chunk |
+| `token` | Surface token |
+| `lemma` | Lemmatized form |
+| `pos` | Part-of-speech tag |
+| `ner` | Lightweight entity flag based on proper-noun POS tags |
+
+A full deep-learning NER model was not used because it increased memory pressure on the local machine. Instead, the pipeline marks proper nouns as lightweight entity candidates with `ENT`; all other tokens receive `O`.
+
+---
+
+# File Format Comparison and Spark Storage Strategy
+
+Parquet and ORC are columnar storage formats designed for analytical workloads. CSV and JSON are row-oriented text formats that are easier to inspect manually but less efficient for repeated Spark analysis. In this project, the ingested corpus is available in all four formats so that their local storage behaviour can be compared.
 
 ```{python}
 #| label: file-format-comparison
 
-import shutil
-
 def dir_size_mb(path: str) -> float:
+    if not os.path.exists(path):
+        return None
     total = sum(
         os.path.getsize(os.path.join(dp, f))
         for dp, _, files in os.walk(path)
@@ -94,39 +206,198 @@ def dir_size_mb(path: str) -> float:
     )
     return round(total / 1_048_576, 2)
 
-parquet_mb = dir_size_mb(f"{DATA}/corpus_parquet")
-orc_mb     = dir_size_mb(f"{DATA}/corpus_orc")
+processed_outputs = [
+    ("Annotated corpus", "corpus_annotated"),
+    ("Ingested corpus — CSV", "corpus_csv"),
+    ("Ingested corpus — JSON", "corpus_json"),
+    ("Ingested corpus — ORC", "corpus_orc"),
+    ("Ingested corpus — Parquet", "corpus_parquet"),
+    ("Stylometry — Zipf", "stylometry_zipf"),
+    ("Readability — sliding", "readability_sliding"),
+    ("Readability — global", "readability_global"),
+    ("Stylometry — POS", "stylometry_pos"),
+    ("Stylometry — dialog", "stylometry_dialog"),
+    ("Stylometry — TTR", "stylometry_ttr"),
+]
 
-fmt_df = pd.DataFrame({
-    "Format":      ["Parquet (Snappy)", "ORC"],
-    "Size (MB)":   [parquet_mb, orc_mb],
-    "Compression": ["Snappy", "zlib (default)"],
-    "Splittable":  ["Yes", "Yes"],
-    "Read speed":  ["Very fast", "Fast"],
-    "Ecosystem":   ["Spark, Pandas, Arrow", "Spark, Hive"],
-})
+sizes_df = pd.DataFrame([
+    {
+        "Dataset": label,
+        "Folder": folder,
+        "Size (MB)": dir_size_mb(f"{DATA}/{folder}"),
+    }
+    for label, folder in processed_outputs
+])
+
+sizes_df = sizes_df.dropna().sort_values("Size (MB)", ascending=False)
 
 fig = px.bar(
-    fmt_df, x="Format", y="Size (MB)",
-    color="Format",
-    color_discrete_sequence=["#4E79A7", "#F28E2B"],
+    sizes_df,
+    x="Dataset",
+    y="Size (MB)",
     text="Size (MB)",
-    title="Corpus size on disk: Parquet vs ORC",
+    title="Processed Spark outputs on disk",
+    labels={"Dataset": "Spark output", "Size (MB)": "Size on disk (MB)"},
 )
 fig.update_traces(textposition="outside")
-fig.update_layout(showlegend=False, yaxis_title="Size (MB)")
+fig.update_xaxes(tickangle=35)
 fig.show()
 
-fmt_df[["Format","Size (MB)","Compression","Splittable","Read speed","Ecosystem"]].style.hide(axis="index")
+sizes_df.style.hide(axis="index")
 ```
 
-**Key takeaways:**
-- Both formats are columnar and splittable — ideal for distributed Spark reads.
-- Parquet with Snappy compression is the default for this pipeline because it
-  offers the best balance of read speed and ecosystem support (Pandas, Arrow,
-  Spark all read it natively).
-- ORC is slightly more compact due to its built-in zlib compression and
-  predicate push-down optimisations favoured by Hive workloads.
+*Figure 1. Size of the main Spark outputs in `DATA/processed`. The annotated corpus is the largest output because the original novels are expanded into token-level rows with lemmas, POS tags, token positions, and metadata.*
+
+In this project, Parquet remains the main downstream analytical format. It is efficient, schema-aware, compressed, splittable, and easy to read from Spark, Pandas, Arrow, and Quarto. ORC was tested as an alternative columnar format. CSV and JSON were exported from the ingested corpus for comparison, not used as the main analytical format.
+
+| Format | Interpretation in this project |
+|---|---|
+| Parquet | Main downstream format. Efficient for Spark analysis, schema-preserving, compressed, and convenient for Pandas/Quarto visualisation. |
+| ORC | Alternative columnar format. Efficient in Spark/Hive-style ecosystems, but less convenient for the Python visualisation stage. |
+| CSV | Useful for manual inspection and simple debugging, but weak schema support and repeated parsing make it unsuitable for the main pipeline. |
+| JSON | More flexible than CSV for semi-structured records, but verbose and slower to scan than columnar formats. |
+
+For this workload, columnar formats are better than CSV or JSON because most analyses read selected columns from large token-level tables. Spark can avoid scanning unnecessary columns and can preserve types across pipeline stages.
+
+The full annotated corpus is kept in Parquet only. Exporting the 3.5-million-row token table to CSV or JSON would be slower, larger, and less useful. The CSV/JSON comparison is therefore limited to the ingested document-level corpus, which is the appropriate level for comparing storage formats without inflating the project with inefficient text exports.
+
+---
+
+# Spark Experience, File Formats, and Performance Profiling
+
+The project uses Spark for the expensive stages: ingestion, cleaning, NLP preparation, annotation output, and group-based aggregation. Pandas is only used in the Quarto report after Spark has already reduced the data into small result tables.
+
+The main expensive checkpoint is the annotated corpus:
+
+```text
+DATA/processed/corpus_annotated
+```
+
+This checkpoint contains **3,514,415 token rows**. It is produced by taking 18 document-level rows, splitting each novel into chunks, running Spark NLP, and exploding token, lemma, POS, and metadata arrays into token-level rows. Once this annotated Parquet dataset exists, readability and stylometry can be rerun without repeating Spark NLP annotation.
+
+Although the raw corpus begins as only 18 novels, the processing workload becomes large after annotation: each document is split into chunks, each chunk is annotated with Spark NLP, and token, lemma, POS, and metadata arrays are exploded into more than 3.5 million token-level rows. The project is therefore not “big data” because of the number of files, but because the NLP transformation expands long literary texts into a large analytical table that requires distributed-style grouping, windowing, partitioning, and checkpointing.
+
+## Spark UI profiling run
+
+For the final profiling run, Spark UI was enabled locally at:
+
+```text
+http://127.0.0.1:4040
+```
+
+The Spark UI confirmed that the application was running as `big_data_nlp_project` on Spark 3.5.1, with FIFO scheduling. The Jobs tab showed the first Parquet read job completing quickly: one completed `parquet` job took about 1 second, with 1 stage and 1 task. The next active job was a `count` action over the annotated corpus, with 1 stage and 4 tasks. This corresponds to the line printed in PowerShell:
+
+```text
+[readability] Token rows: 3514415
+```
+
+The same setup was used for the stylometry rerun. The PowerShell logs confirmed that Spark UI was active and that both analytical reruns processed the same annotated checkpoint:
+
+```text
+[spark_session] Spark UI: http://127.0.0.1:4040
+[spark_session] Spark session created.
+```
+
+The readability run successfully produced both outputs:
+
+```text
+[readability] Token rows: 3514415
+[readability] Global scores saved to DATA/processed/readability_global
+[readability] Sliding scores saved to DATA/processed/readability_sliding
+[readability] Done.
+```
+
+The stylometry run also completed successfully:
+
+```text
+[stylometry] Token rows: 3514415
+[stylometry] Zipf saved to DATA/processed/stylometry_zipf
+[stylometry] Dialog summary saved to DATA/processed/stylometry_dialog
+[stylometry] TTR saved to DATA/processed/stylometry_ttr
+[stylometry] POS distribution saved to DATA/processed/stylometry_pos
+[stylometry] Done.
+```
+
+The screenshots below were taken from the local Spark UI during the profiling run and stored in the project folder `screenshot/`.
+
+```{python}
+#| label: spark-ui-screenshots
+#| echo: false
+
+screenshot_dir = Path("screenshot")
+screenshot_files = sorted(screenshot_dir.glob("*.png"))
+
+if screenshot_files:
+    for i, img in enumerate(screenshot_files, start=1):
+        display(Markdown(f"**Spark UI screenshot {i}:** `{img.name}`"))
+        display(Image(filename=str(img)))
+else:
+    display(Markdown("_No Spark UI screenshots found in `screenshot/`._"))
+```
+
+*Figure 2. Spark UI Jobs tab during the readability/stylometry profiling run. The UI shows Spark 3.5.1, the local application `big_data_nlp_project`, FIFO scheduling, a completed Parquet read job, and an active count job over the annotated corpus.*
+
+These profiling runs show that the expensive work happens before the Quarto report stage. Spark reads the materialised annotated Parquet checkpoint, performs aggregations and window operations, writes reduced Parquet outputs, and only then does Quarto load the reduced tables with Pandas for visualisation.
+
+## Shuffle-heavy operations
+
+Several operations trigger important Spark shuffles:
+
+| Operation | Why it causes a shuffle | Output |
+|---|---|---|
+| `groupBy(author, document_id, language)` | Rows are redistributed by document | Global readability |
+| Window functions over `chunk_id` | Ordered chunk windows are computed per document | Sliding readability |
+| `groupBy(author, document_id, token)` | Token frequencies are collected per document | Zipf curves |
+| `countDistinct(lemma)` | Unique lexical types must be aggregated | Type-token ratio |
+| `groupBy(author, document_id, pos)` | POS counts are aggregated by text and author | POS distributions |
+| `partitionBy(author)` | Rows are physically reorganised by author on disk | Parquet output folders |
+
+## Mitigation strategies used in this project
+
+The main optimisation strategy was to avoid recomputing expensive stages. The project therefore uses materialised Parquet outputs as durable checkpoints between stages.
+
+| Bottleneck or issue | Mitigation used | Practical effect |
+|---|---|---|
+| Recomputing Spark NLP annotation | The annotated token table is written once to `DATA/processed/corpus_annotated` | Readability and stylometry can be rerun without repeating the most expensive NLP stage |
+| Reusing the annotated token table inside one script | `.cache()` is used in the readability and stylometry scripts | The same token table can support several aggregations during the same Spark application |
+| Reusing chunk-level readability statistics | The per-chunk readability table is cached before computing sliding windows | The 5-, 10-, and 20-chunk windows reuse the same intermediate table |
+| Author-level comparisons | Outputs are written with `partitionBy(author)` | Later author-level analyses can benefit from partition pruning |
+| Expensive visualisation from millions of rows | Spark writes reduced analytical tables before Quarto loads anything | The Quarto report uses Pandas only on small Parquet outputs, not on the full token table |
+
+This strategy is more important than keeping everything in memory. On a local Windows machine, Spark NLP annotation creates the highest JVM pressure, so durable Parquet checkpoints make the workflow more stable and easier to rerun.
+
+The readability run first caches the annotated token table, then computes global readability and sliding-window readability. The global readability stage aggregates token-level rows into one row per document. The sliding readability stage first creates per-chunk statistics, caches them, and reuses them for 5-, 10-, and 20-chunk windows.
+
+The stylometry run reuses the same annotated checkpoint. Zipf is shuffle-heavy because it groups millions of tokens by document and token form. TTR is also expensive because it uses `countDistinct(lemma)`. POS distribution groups token rows by document and POS tag. Dialog segmentation uses ordered token positions, especially `(chunk_id, token_id)`, to preserve local textual order after Spark transformations.
+
+## Partitioning and checkpoint strategy
+
+The processed outputs are written as Spark datasets, not as single files. The annotated corpus is stored in Hive-style author partitions such as:
+
+```text
+DATA/processed/corpus_annotated/author=balzac/
+DATA/processed/corpus_annotated/author=dickens/
+DATA/processed/corpus_annotated/author=hugo/
+```
+
+This layout matches the analysis design because many questions compare authors. If an analysis filters by author, Spark can prune irrelevant partitions instead of scanning the full token table.
+
+The most useful mitigation strategy is not aggressive in-memory caching, but staged Parquet output. Parquet outputs act as durable checkpoints between expensive stages. Once `DATA/processed/corpus_annotated` exists, later scripts can reload it directly without recomputing Spark NLP annotation. This is especially important on a local Windows machine, where Spark NLP creates the highest JVM memory pressure.
+
+Caching is still useful inside individual scripts. In `src/readability.py`, the annotated token table is cached while global and sliding readability are computed. The per-chunk readability table is also cached because it is reused for multiple sliding-window sizes. In `src/stylometry.py`, the annotated token table is cached while Zipf, dialog, TTR, and POS metrics are computed.
+
+## Windows execution notes
+
+The project runs in local Spark mode on Windows. The workflow is written with Spark DataFrames and is parallelisable, but the final stable configuration prioritised reliability over maximum local parallelism because Spark NLP created JVM memory pressure on this machine.
+
+During the profiling runs, Spark occasionally emitted shutdown warnings when deleting temporary `.jar` files after successful execution. These warnings occurred after the outputs had already been written:
+
+```text
+Exception while deleting Spark temp dir
+Failed to delete ... software.amazon.ion_ion-java-1.0.2.jar
+```
+
+This is a Windows/Spark temporary-file cleanup issue. It did not affect the generated Parquet datasets or the analytical results.
 
 ---
 
@@ -151,10 +422,9 @@ fig.update_xaxes(tickangle=45)
 fig.show()
 ```
 
-The corpus spans **3.5 million tokens** across 18 novels. Hugo's
-*Les Misérables* and Dumas's *Le Comte de Monte-Cristo* dominate by length.
-French novels make up 14 of the 18 documents; the four English texts are by
-Dickens and Sand (whose *Indiana* is represented here by its English translation).
+*Figure 3. Corpus size by document, measured after tokenisation and punctuation filtering. The longest texts dominate later aggregate metrics, so length effects must be considered when interpreting TTR and Zipf results.*
+
+The corpus spans **3.5 million tokens** across 18 novels. Hugo's *Les Misérables* and Dumas's *Le Comte de Monte-Cristo* dominate by length. Most documents are English or English translations. The French-language subset consists of Stendhal's two novels and Zola's *Nana*.
 
 ---
 
@@ -162,39 +432,63 @@ Dickens and Sand (whose *Indiana* is represented here by its English translation
 
 ## Global readability scores
 
-Readability is computed using two formulas adapted to the corpus languages:
+Readability is computed using formulas adapted to the corpus languages:
 
-- **Flesch Reading Ease** (English): $206.835 - 1.015 \cdot \frac{W}{S} - 84.6 \cdot \frac{Syl}{W}$
-- **Kandel-Moles** (French, adapted Flesch): $207.0 - 1.015 \cdot \frac{W}{S} - 73.6 \cdot \frac{Syl}{W}$
+- **Flesch-Kincaid Grade Level** for English texts: $0.39 \cdot \frac{W}{S} + 11.8 \cdot \frac{Syl}{W} - 15.59$
+- **Kandel-Moles** for French texts: $207.0 - 1.015 \cdot \frac{W}{S} - 73.6 \cdot \frac{Syl}{W}$
 
-Scores roughly in [0, 100]: below 30 = very difficult; 60–70 = standard; above 70 = easy.
+These two indices are not on the same scale. Flesch-Kincaid is a grade-level difficulty score: higher values indicate a higher estimated reading grade level. Kandel-Moles is an ease score for French: higher values indicate easier texts. They are therefore interpreted within language group rather than as one universal cross-language scale.
 
 ```{python}
 #| label: readability-global
 
 rd = add_era(load(f"{DATA}/readability_global"))
 
+rd_plot = rd.sort_values(["readability_index", "readability_score"]).copy()
+rd_plot["score_label"] = rd_plot["readability_score"].round(2)
+
 fig = px.bar(
-    rd.sort_values("readability_score"),
-    x="readability_score", y="document_id",
+    rd_plot,
+    x="readability_score",
+    y="document_id",
     color="era",
     color_discrete_map=ERA_COLOURS,
     orientation="h",
+    facet_col="readability_index",
+    facet_col_wrap=2,
     labels={
-        "readability_score": "Readability score",
+        "readability_score": "Readability index value",
         "document_id": "Document",
         "era": "Era",
     },
-    title="Global readability scores by document",
-    hover_data=["Author", "readability_index", "avg_sentence_length",
+    title="Global readability indices by document",
+    hover_data=["Author", "language", "avg_sentence_length",
                 "avg_syllables_per_word"],
-    text=rd.sort_values("readability_score")["readability_score"].round(1),
+    text="score_label",
 )
 fig.update_traces(textposition="outside")
-fig.add_vline(x=60, line_dash="dash", line_color="grey",
-              annotation_text="60 — standard threshold")
+fig.update_xaxes(matches=None)
+fig.update_yaxes(matches=None)
 fig.show()
+
+readability_table = (
+    rd[[
+        "Author",
+        "document_id",
+        "language",
+        "readability_index",
+        "readability_score",
+        "avg_sentence_length",
+        "avg_syllables_per_word",
+    ]]
+    .sort_values(["language", "readability_score"])
+    .round(2)
+)
+
+readability_table.style.hide(axis="index")
 ```
+
+*Figure 4. Global readability indices by document. English texts use Flesch-Kincaid Grade Level; French texts use Kandel-Moles. The two scales should be interpreted separately.*
 
 ```{python}
 #| label: readability-scatter
@@ -213,58 +507,70 @@ fig = px.scatter(
         "era": "Era",
     },
     title="Sentence length vs syllabic density (bubble = corpus size)",
-    hover_data=["Author", "readability_score"],
+    hover_data=["Author", "language", "readability_index", "readability_score"],
 )
 fig.update_traces(textposition="top center")
 fig.show()
 ```
 
-**Observations:**
-- Stendhal shows the highest syllabic density (~1.83 syl/word), indicating
-  a more Latinate, abstract vocabulary.
-- Sand's *Indiana* has the longest average sentences (24.5 words), pulling its
-  Flesch score down to 50 — the only text below "fairly difficult".
-- Romantic authors cluster slightly higher in readability on average, though
-  the difference is modest; sentence complexity varies more by author than by era.
+*Figure 5. Relationship between sentence length and syllabic density. Bubble size represents document length, so large works such as Hugo and Dumas have greater visual weight.*
 
-## Readability across chunks (sliding window)
+**Observations:**
+
+- Among English texts, Zola's translated *Germinal*, Balzac's *La Cousine Bette*, and Sand's *Indiana* receive the highest Flesch-Kincaid Grade Level values, reflecting longer sentences and/or higher syllabic density.
+- Among French texts, Stendhal's *La Chartreuse de Parme* receives the lowest Kandel-Moles score, mainly because of its high syllabic density.
+- Sentence complexity varies more by author and document than by era alone, so readability should not be interpreted as a simple Romantic-vs-Realist divide.
+
+## Readability across chunks: sliding window
 
 ```{python}
 #| label: readability-sliding
 
 sl = add_era(load(f"{DATA}/readability_sliding"))
-sl10 = sl[sl["window_size"] == 10].copy()
+sl["window_size_label"] = sl["window_size"].astype(str) + " chunks"
 
-# pick a representative subset for clarity
-selected = ["les_miserables", "madame_bovary", "bleak_house",
-            "le_rouge_et_le_noir", "indiana"]
-sl10_sel = sl10[sl10["document_id"].isin(selected)]
+selected = ["les_miserables", "madame_bovary", "bleak_house"]
+sl_sel = sl[sl["document_id"].isin(selected)].copy()
 
 fig = px.line(
-    sl10_sel,
-    x="chunk_id", y="readability_score",
+    sl_sel,
+    x="chunk_id",
+    y="readability_score",
     color="document_id",
+    line_dash="window_size_label",
     labels={
-        "chunk_id":          "Chunk position",
-        "readability_score": "Readability score (window=10)",
-        "document_id":       "Document",
+        "chunk_id": "Chunk position",
+        "readability_score": "Flesch-Kincaid Grade Level",
+        "document_id": "Document",
+        "window_size_label": "Window size",
     },
-    title="Readability over narrative time (5 selected novels, window=10 chunks)",
+    title="Sliding readability for three English-language representative novels",
 )
 fig.show()
+
+window_summary = (
+    sl.groupby(["language", "readability_index", "window_size"])
+      .agg(
+          mean_score=("readability_score", "mean"),
+          std_score=("readability_score", "std"),
+          min_score=("readability_score", "min"),
+          max_score=("readability_score", "max"),
+      )
+      .round(2)
+      .reset_index()
+)
+window_summary.style.hide(axis="index")
 ```
 
-The sliding-window view reveals within-novel variation: readability is rarely
-constant — it dips during dense descriptive or philosophical passages and rises
-in dialogue-heavy sections.
+*Figure 6. Sliding-window readability for three representative English-language novels. The same documents are plotted with 5-, 10-, and 20-chunk windows to show the smoothing effect of larger windows.*
+
+The sliding-window view reveals within-novel variation: readability is rarely constant. Smaller windows capture local stylistic shifts but are noisier; larger windows smooth the curve and produce more stable trends. This is why the report compares three window sizes rather than relying on a single arbitrary value.
 
 ---
 
 # Zipf Analysis
 
-Zipf's law predicts that in natural language the frequency of a word is
-inversely proportional to its rank. On a log-log plot this appears as a
-straight line with slope ≈ −1.
+Zipf's law predicts that in natural language the frequency of a word is inversely proportional to its rank. On a log-log plot this appears as a straight line with slope close to −1.
 
 ```{python}
 #| label: zipf
@@ -299,21 +605,19 @@ fig = px.line(
 fig.show()
 ```
 
+*Figure 7. Zipf curves for one representative work per author. The near-linear log-log relation confirms that the token distributions follow the expected Zipfian pattern.*
+
 **Observations:**
-- All novels follow the expected linear log-log relationship, confirming Zipf's
-  law holds across both languages and eras.
-- The slopes are nearly identical across authors — a universal property of
-  natural language, not a stylistic fingerprint.
-- Differences appear in the intercept (overall vocabulary richness) rather
-  than slope.
+
+- All novels follow the expected linear log-log relationship, confirming that Zipf's law holds across both languages and eras.
+- The slopes are nearly identical across authors, which suggests a general property of natural language rather than a strong stylistic fingerprint.
+- Differences appear more in the intercept and vocabulary richness than in the slope itself.
 
 ---
 
-# Type-Token Ratio (TTR)
+# Type-Token Ratio
 
-TTR = unique lemmas / total word tokens. A higher TTR indicates greater
-lexical diversity. Because TTR decreases with text length, results should be
-compared with document size in mind.
+TTR = unique lemmas / total word tokens. A higher TTR indicates greater lexical diversity. Because TTR decreases with text length, results should be compared with document size in mind.
 
 ```{python}
 #| label: ttr
@@ -354,20 +658,19 @@ fig.update_yaxes(title_text="TTR", row=1, col=2)
 fig.show()
 ```
 
+*Figure 8. Type-token ratio by document and against corpus size. The scatterplot makes the length effect visible: shorter documents tend to have higher TTR.*
+
 **Observations:**
-- Shorter novels (Balzac's *Eugénie Grandet*, Zola's *L'Assommoir*) show
-  higher TTR by the length effect — they simply repeat fewer words.
-- Among long novels, Hugo's *Les Misérables* retains a relatively high TTR
-  (unique lemma count: 29,955), reflecting its encyclopaedic scope.
-- Dickens's TTR appears low (~0.04–0.06) because all three novels are very
-  long; his absolute unique lemma counts are among the highest in the corpus.
+
+- Shorter novels such as Balzac's *Eugénie Grandet* and Zola's *L'Assommoir* show higher TTR partly because they repeat fewer words.
+- Among long novels, Hugo's *Les Misérables* retains a high absolute vocabulary size with more than 24,000 unique lemmas.
+- Dickens's TTR appears low because all three Dickens novels are long; his absolute unique lemma counts remain high in the corpus.
 
 ---
 
 # POS Distribution
 
-Part-of-speech ratios reveal authorial style: noun-heavy prose tends towards
-description; verb-heavy towards action; adjective-heavy towards elaboration.
+Part-of-speech ratios reveal authorial style: noun-heavy prose tends towards description; verb-heavy prose towards action; adjective-heavy prose towards elaboration.
 
 ```{python}
 #| label: pos
@@ -401,6 +704,8 @@ fig.update_xaxes(tickangle=30)
 fig.show()
 ```
 
+*Figure 9. Author-level POS distributions after normalising English Penn Treebank tags to broader UD-style categories.*
+
 ```{python}
 #| label: pos-heatmap
 
@@ -418,22 +723,19 @@ fig = px.imshow(
 fig.show()
 ```
 
+*Figure 10. POS heatmap by author. Darker cells indicate higher relative use of the corresponding part-of-speech category.*
+
 **Observations:**
-- Nouns dominate all authors (as expected in 19th-century literary prose).
-- Zola and Flaubert show relatively higher adjective ratios, consistent with
-  Realist attention to sensory description.
-- Stendhal's higher PROPN ratio reflects his dense cast of proper names and
-  political references.
+
+- Nouns dominate all authors, as expected in 19th-century literary prose.
+- Zola and Flaubert show relatively high adjective ratios, consistent with Realist attention to sensory description.
+- Stendhal's proper-noun ratio reflects his dense cast of names and political references.
 
 ---
 
 # Dialog vs Narration
 
-Dialog was detected using quotation markers (`«»`, `""`, `"`). Em-dash
-dialog — predominant in French literary convention (Hugo, Dumas, Zola, much
-of Balzac) — cannot be recovered from the tokenised corpus because line
-position is not preserved after chunking. Results should be interpreted as a
-**lower bound** on dialog proportion.
+Dialog was detected using straight quotation marks, curly English quotation marks, French guillemets, and Gutenberg-style dash dialogue markers such as `--`, `--Text`, `:--`, `—`, `–`, and `―`. The dash-based part remains approximate because it is applied after tokenisation, but it captures the main dialogue conventions observed in the source files.
 
 ```{python}
 #| label: dialog
@@ -446,12 +748,12 @@ fig = px.bar(
     color="era",
     color_discrete_map=ERA_COLOURS,
     labels={
-        "dialog_ratio": "Dialog ratio (lower bound)",
+        "dialog_ratio": "Detected dialog ratio",
         "document_id":  "Document",
         "era":          "Era",
     },
-    title="Dialog ratio by document (quote-marker detection only)",
-    hover_data=["Author", "dialog_tokens", "total_tokens"],
+    title="Dialog ratio by document (quote and dash detection)",
+    hover_data=["Author", "language", "dialog_tokens", "total_tokens"],
     text=dlg.sort_values("dialog_ratio", ascending=False)["dialog_ratio"].round(3),
 )
 fig.update_traces(textposition="outside")
@@ -459,30 +761,132 @@ fig.update_xaxes(tickangle=45)
 fig.show()
 ```
 
+*Figure 11. Detected dialog ratio by document. The method captures explicit quotation and dash dialogue markers, but remains approximate because it is applied after chunking and tokenisation.*
+
 **Observations:**
-- Flaubert's *L'Éducation sentimentale* and Balzac's *Eugénie Grandet* show
-  the highest detected dialog ratios (~46–48%), as both use French guillemets
-  (`«»`) consistently.
-- Sand's *Indiana* (English translation) registers ~34%, detected via curly
-  English quotes.
-- The zeros for Hugo, Dumas, most of Balzac, and all of Zola reflect their
-  em-dash dialog convention rather than an absence of dialog.
+
+- Zola's *L'Assommoir*, Flaubert's *L'Éducation sentimentale*, Balzac's *Eugénie Grandet*, and Sand's *Indiana* show the highest detected dialog ratios.
+- Stendhal's two French novels and Zola's *Nana* now show non-zero detected dialog ratios because the method includes double-hyphen and dash-style dialogue markers.
+- Some English novels still show very low values, especially where quotation marks are not tokenised as standalone markers or where dialogue formatting is lost during chunking.
+- This limitation is methodological: dialog detection works best when punctuation markers survive as explicit tokens in the annotated corpus.
 
 ---
 
 # Conclusion
 
-This analysis demonstrates a fully distributed literary NLP pipeline on a
-local Windows machine using PySpark and Spark NLP. Key findings:
+This analysis demonstrates a reproducible literary NLP pipeline on a local Windows machine using PySpark and Spark NLP. Key findings:
 
 | Dimension | Key result |
 |-----------|-----------|
-| **Readability** | Stendhal is the most lexically dense (highest syl/word); Sand writes the longest sentences |
+| **Readability** | English texts are evaluated with Flesch-Kincaid Grade Level; French texts are evaluated with Kandel-Moles. Because these indices have different scales, results are interpreted within language group rather than as one universal score |
+| **Sliding readability** | Smaller windows reveal local variation, while larger windows smooth the curve and give more stable document-level trends |
 | **Zipf** | All 18 novels obey Zipf's law regardless of language or era |
-| **TTR** | Hugo's *Les Misérables* has the largest vocabulary in absolute terms |
-| **POS** | Realists (Flaubert, Zola) use slightly more adjectives; all authors are noun-heavy |
-| **Dialog** | Quote-marker detection captures ~34–48% dialog in texts using guillemets/curly quotes; em-dash dialog undetectable without line-position data |
-| **File formats** | Parquet (Snappy) and ORC both perform well; Parquet chosen for its broader ecosystem support |
+| **TTR** | Hugo's *Les Misérables* has the largest vocabulary in absolute terms, while shorter works naturally obtain higher TTR values |
+| **POS** | Realists such as Flaubert and Zola show slightly higher adjective ratios; all authors remain noun-heavy |
+| **Dialog** | Quote and dash detection captures several major dialogue conventions, but underestimates cases where formatting is lost or markers are not tokenised cleanly |
+| **File formats** | Parquet and ORC provide efficient columnar storage; CSV and JSON are useful comparison exports but weaker for repeated Spark analysis |
+| **Spark profiling** | Spark UI was enabled during the final readability and stylometry reruns; both processed 3,514,415 annotated token rows from the Parquet checkpoint |
+| **Spark execution** | The main bottleneck is Spark NLP annotation; partitioned Parquet outputs act as durable checkpoints between expensive stages |
 
-The pipeline is reproducible end-to-end via `run_all.py` and all intermediate
-outputs are stored in Parquet for efficient downstream access.
+The pipeline is reproducible end-to-end via `run_all.py`. Intermediate outputs are stored as partitioned Parquet datasets so that later analysis can restart from stable checkpoints instead of recomputing annotation.
+
+The main remaining limitation is dialog segmentation. The current method detects several observed dialogue markers, but a stronger version would detect dialogue earlier from cleaned text before chunking and token-level explosion.
+
+---
+
+# Appendix: Reproducibility and Code Structure
+
+The appendix summarises the reproducible project structure. The main body of the report presents the analysis, while the reusable pipeline code is kept in the project scripts and source modules.
+
+The full reusable code is stored in the GitHub repository rather than copied repeatedly into the report body. This avoids copy-paste coding and follows the DRY requirement. The main pipeline logic is implemented in `src/ingest.py`, `src/clean.py`, `src/annotate.py`, `src/readability.py`, and `src/stylometry.py`; the graphical pipeline is implemented as reusable Quarto Python chunks in `report.qmd`.
+
+## Pipeline implementation summary
+
+| File | Role |
+|---|---|
+| `run_all.py` | Orchestrates the full pipeline from raw corpus to analytical outputs |
+| `run_readability.py` | Reruns readability only from the annotated Parquet checkpoint |
+| `run_stylometry.py` | Reruns stylometry only from the annotated Parquet checkpoint |
+| `src/spark_session.py` | Creates the local Spark session and configures the Windows/Spark environment |
+| `src/ingest.py` | Loads raw `.txt` files, attaches metadata, and writes Parquet/ORC corpus versions |
+| `src/clean.py` | Removes Gutenberg boilerplate, normalises whitespace, and computes document statistics |
+| `src/annotate.py` | Chunks texts and runs French/English Spark NLP pipelines |
+| `src/readability.py` | Computes global and sliding-window readability scores |
+| `src/stylometry.py` | Computes Zipf curves, dialog summary, TTR, and POS distributions |
+| `report.qmd` | Loads reduced outputs and produces the final visual report |
+
+The Quarto report does not recompute the expensive NLP steps. It loads reduced Parquet outputs generated by the Spark scripts. This follows the lab requirement that the extraction and graphical pipelines remain reproducible while avoiding unnecessary recomputation in the rendered report.
+
+## Project commands
+
+From the project root:
+
+```powershell
+.\.venv\Scripts\python.exe run_all.py
+quarto render report.qmd
+```
+
+To rerun only the analytical stages from the existing annotated checkpoint:
+
+```powershell
+.\.venv\Scripts\python.exe run_readability.py
+.\.venv\Scripts\python.exe run_stylometry.py
+```
+
+The CSV and JSON comparison exports were produced from the ingested Parquet corpus without rerunning Spark NLP annotation:
+
+```powershell
+@'
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder
+    .appName("export_csv_json_only")
+    .master("local[1]")
+    .getOrCreate()
+)
+
+df = spark.read.parquet("DATA/processed/corpus_parquet")
+
+df.write.mode("overwrite").partitionBy("author").option("header", True).option("quoteAll", True).csv("DATA/processed/corpus_csv")
+df.write.mode("overwrite").partitionBy("author").json("DATA/processed/corpus_json")
+
+spark.stop()
+print("CSV and JSON exports written.")
+'@ | .\.venv\Scripts\python.exe
+```
+
+During the final profiling reruns, Spark UI was enabled at:
+
+```text
+http://127.0.0.1:4040
+```
+
+The full `run_all.py` command rebuilds the processed Spark outputs from raw text. The standalone readability and stylometry commands reuse `DATA/processed/corpus_annotated`, avoiding a full Spark NLP rerun.
+
+## Output folders
+
+| Folder | Content |
+|---|---|
+| `DATA/processed/corpus_parquet` | Ingested corpus saved as Parquet |
+| `DATA/processed/corpus_orc` | Ingested corpus saved as ORC |
+| `DATA/processed/corpus_csv` | Ingested corpus exported as CSV for file-format comparison |
+| `DATA/processed/corpus_json` | Ingested corpus exported as JSON for file-format comparison |
+| `DATA/processed/corpus_annotated` | Token-level Spark NLP annotations, partitioned by author |
+| `DATA/processed/readability_global` | One readability row per document |
+| `DATA/processed/readability_sliding` | Sliding readability with 5-, 10-, and 20-chunk windows |
+| `DATA/processed/stylometry_zipf` | Token rank-frequency tables |
+| `DATA/processed/stylometry_dialog` | Dialog/narration summary by document |
+| `DATA/processed/stylometry_ttr` | Type-token ratio by document |
+| `DATA/processed/stylometry_pos` | POS ratios by document and author |
+| `screenshot/` | Spark UI screenshots from the final profiling reruns |
+
+## Notes on limitations
+
+The corpus is large enough to demonstrate Spark-style processing, partitioned storage, and distributed aggregations, but it is still a local academic dataset rather than an industrial-scale cluster workload. The most realistic big-data pressure comes from Spark NLP annotation, which expands document-level text into token-level rows and creates memory pressure on the JVM.
+
+Dialog segmentation is approximate. It works best when dialogue markers are preserved as visible tokens, including straight quotes, curly quotes, guillemets, and Gutenberg-style double hyphens. It underestimates texts where quotation marks are attached to words, where layout information is lost, or where dialogue boundaries are not recoverable from the token-level table.
+
+Spark UI profiling was performed locally rather than on a cluster. The UI and PowerShell logs are still useful because they show the concrete job structure of the analytical reruns: Parquet reads, count actions, grouped aggregations, window operations, and partitioned Parquet writes.
+
+On Windows, Spark sometimes emits shutdown warnings when deleting temporary `.jar` files after successful execution. These warnings appeared after the outputs had already been written and did not affect the generated Parquet datasets.

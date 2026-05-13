@@ -7,22 +7,18 @@ Windows stability notes
 -----------------------
 Previous attempts to pre-reserve ports with Python sockets before passing
 them to Spark failed because SO_REUSEADDR on Windows allows a *second* bind
-to succeed (stealing the port), rather than blocking it as on Linux.  The
+to succeed (stealing the port), rather than blocking it as on Linux. The
 reservation sockets were actively preventing the JVM from binding, forcing
 Spark to fall back to a different driver port while the BlockManager still
 expected the original one — causing the NullPointerException in
 BlockManagerMasterEndpoint.
 
 Solution: use port 0 (OS-assigned) for both the driver and the BlockManager,
-combined with maxRetries=128 and full 127.0.0.1 isolation.  On a single-node
+combined with maxRetries=128 and full 127.0.0.1 isolation. On a single-node
 local session the OS will assign stable ports immediately with no conflicts.
 
-The BlockManager NPE (Cannot invoke "BlockManagerId.executorId()" because
-"idWithoutTopologyInfo" is null) is a Spark 3.5 / Windows race condition
-that is resolved by:
-  1. Not fighting Spark over port numbers.
-  2. Setting spark.local.ip in the builder (not just as an env var).
-  3. Disabling the Spark UI (one fewer RPC endpoint to race against).
+For profiling, Spark UI is enabled on localhost. This lets us inspect jobs,
+stages, SQL/DataFrame plans, and shuffle activity for the final report.
 """
 
 import os
@@ -102,14 +98,14 @@ def create_spark_session(app_name: str = "big_data_nlp_project") -> SparkSession
 
     Key design decisions for Windows stability:
     - Port 0 for driver and BlockManager: let the OS assign free ports
-      atomically inside the JVM.  Pre-reserving from Python causes conflicts
+      atomically inside the JVM. Pre-reserving from Python causes conflicts
       on Windows due to SO_REUSEADDR semantics.
-    - spark.local.ip set in the builder (not just env var): the JVM-side
+    - spark.local.ip set in the builder, not just as an env var: the JVM-side
       Spark config must also see 127.0.0.1 or the driver may bind on the
       wrong interface.
-    - spark.ui.enabled false: removes one RPC endpoint that can race during
-      BlockManager initialisation.
-    - local[1]: single executor thread eliminates inter-executor RPC races.
+    - Spark UI enabled for profiling at http://127.0.0.1:4040.
+    - local[1]: single executor thread reduces inter-executor RPC races on
+      the local Windows setup.
     """
     python_executable = sys.executable
     _configure_environment(python_executable)
@@ -122,12 +118,10 @@ def create_spark_session(app_name: str = "big_data_nlp_project") -> SparkSession
         .appName(app_name)
         .master("local[1]")
 
-        # ---- Networking (Windows loopback, no port pre-reservation) --------
+        # ---- Networking: Windows loopback, no port pre-reservation ----------
         .config("spark.local.ip",            "127.0.0.1")
         .config("spark.driver.host",         "127.0.0.1")
         .config("spark.driver.bindAddress",  "127.0.0.1")
-        # Port 0 = OS picks a free port atomically inside the JVM.
-        # This is safe because local[1] has no separate executor process.
         .config("spark.driver.port",         "0")
         .config("spark.blockManager.port",   "0")
         .config("spark.port.maxRetries",     "128")
@@ -143,9 +137,13 @@ def create_spark_session(app_name: str = "big_data_nlp_project") -> SparkSession
         .config("spark.serializer",                     "org.apache.spark.serializer.KryoSerializer")
         .config("spark.kryoserializer.buffer.max",      "1024m")
         .config("spark.sql.parquet.compression.codec",  "snappy")
-        .config("spark.ui.enabled",                     "false")
 
-        # ---- Timeouts (generous for slow local Windows JVM starts) ---------
+        # ---- Spark UI for profiling ----------------------------------------
+        .config("spark.ui.enabled",             "true")
+        .config("spark.ui.port",                "4040")
+        .config("spark.ui.showConsoleProgress", "true")
+
+        # ---- Timeouts ------------------------------------------------------
         .config("spark.network.timeout",            "600s")
         .config("spark.executor.heartbeatInterval", "60s")
         .config("spark.rpc.askTimeout",             "600s")
@@ -158,7 +156,7 @@ def create_spark_session(app_name: str = "big_data_nlp_project") -> SparkSession
         # ---- Spark NLP -----------------------------------------------------
         .config("spark.jars.packages", SPARK_NLP_PACKAGE)
 
-        # ---- Java module access (Java 11+) ---------------------------------
+        # ---- Java module access: Java 11+ ----------------------------------
         .config("spark.driver.extraJavaOptions",   java_opts)
         .config("spark.executor.extraJavaOptions", java_opts)
 
@@ -166,5 +164,12 @@ def create_spark_session(app_name: str = "big_data_nlp_project") -> SparkSession
     )
 
     spark.sparkContext.setLogLevel("WARN")
+
+    ui_url = spark.sparkContext.uiWebUrl
+    if ui_url:
+        print(f"[spark_session] Spark UI: {ui_url}")
+    else:
+        print("[spark_session] Spark UI URL unavailable.")
+
     print("[spark_session] Spark session created.")
     return spark

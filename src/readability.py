@@ -4,12 +4,12 @@ src/readability.py
 Readability indices for the literary corpus.
 
 Computes:
-  - Global per-document Flesch-Kincaid (EN) and Kandel-Moles (FR) indices
+  - Global per-document Flesch-Kincaid Grade Level (EN) and Kandel-Moles (FR)
   - Sliding-window versions over configurable window sizes
 
 Input
 -----
-Annotated token table:  DATA/processed/corpus_annotated
+Annotated token table: DATA/processed/corpus_annotated
     columns: document_id, language, chunk_id (int), token, lemma, pos, ner, author
 
 Output
@@ -19,11 +19,20 @@ DATA/processed/readability_sliding  (parquet, partitioned by author)
 
 Formulas
 --------
-Flesch Reading Ease (EN):
-    206.835 - 1.015 * (words / sentences) - 84.6 * (syllables / words)
+Flesch-Kincaid Grade Level (EN):
+    0.39 * (words / sentences) + 11.8 * (syllables / words) - 15.59
 
 Kandel-Moles (FR, adapted Flesch for French):
-    207.0   - 1.015 * (words / sentences) - 73.6 * (syllables / words)
+    207.0 - 1.015 * (words / sentences) - 73.6 * (syllables / words)
+
+Important interpretation note:
+    Flesch-Kincaid Grade Level is a grade-level difficulty score:
+    higher values mean more difficult English texts.
+
+    Kandel-Moles is an ease score:
+    higher values mean easier French texts.
+
+    They are both readability indices, but they are not on the same scale.
 
 Syllables: vowel-group heuristic, min 1 per word, language-aware vowel sets.
 Sentences: terminal punctuation tokens (., !, ?) detected directly from the
@@ -43,7 +52,7 @@ from pyspark.sql import types as T
 # Syllable counting
 # ---------------------------------------------------------------------------
 
-# Vowel groups per language.  French adds accented vowels.
+# Vowel groups per language. French adds accented vowels.
 _VOWELS_EN = re.compile(r"[aeiouy]+", re.IGNORECASE)
 _VOWELS_FR = re.compile(r"[aeiouyàâäéèêëîïôùûüœæ]+", re.IGNORECASE)
 
@@ -59,14 +68,17 @@ def _count_syllables(token: str, lang: str) -> int:
     """
     if not token or _NOT_A_WORD.match(token):
         return 0
+
     pattern = _VOWELS_FR if lang == "fr" else _VOWELS_EN
     groups = pattern.findall(token)
+
     return max(1, len(groups))
 
 
 def _syllable_udf_factory():
     """
     Return a UDF that takes (token: str, language: str) -> int.
+
     Defined inside a factory so the closure captures only pure Python objects.
     """
     import re
@@ -78,8 +90,10 @@ def _syllable_udf_factory():
     def _syllables(token, lang):
         if not token or not_a_word.match(token):
             return 0
+
         pattern = vowels_fr if lang == "fr" else vowels_en
         groups = pattern.findall(token)
+
         return max(1, len(groups))
 
     return F.udf(_syllables, T.IntegerType())
@@ -147,7 +161,8 @@ def _per_chunk_stats(token_df: DataFrame) -> DataFrame:
         .agg(
             F.sum("is_word").cast("long").alias("word_count"),
             F.sum("syllables").cast("long").alias("syllable_count"),
-            # +1 so that the last sentence (no trailing punctuation) is counted
+            # +1 so that the last sentence in each chunk is counted even if
+            # the chunk does not end with sentence-final punctuation.
             (F.sum("is_sent_end") + F.lit(1)).cast("long").alias("sentence_count"),
         )
     )
@@ -168,32 +183,50 @@ def _readability_from_agg(
     """
     Compute readability score from aggregated word/syllable/sentence counts.
 
-    For English  → Flesch Reading Ease
-    For French   → Kandel-Moles
+    For English:
+        Flesch-Kincaid Grade Level
+        Higher score = higher estimated grade level = more difficult.
 
-    Both return a score roughly in [0, 100]:
-      < 30   very difficult
-      30-50  difficult
-      50-60  fairly difficult
-      60-70  standard
-      > 70   easy
+    For French:
+        Kandel-Moles
+        Higher score = easier.
+
+    Because these indices have different interpretations, raw English and
+    French readability_score values should not be interpreted as one universal
+    0-100 difficulty scale.
     """
     words = F.col(word_col).cast("double")
-    syls  = F.col(syl_col).cast("double")
+    syls = F.col(syl_col).cast("double")
     sents = F.col(sent_col).cast("double")
 
-    # Guard: avoid division by zero
+    # Guard: avoid division by zero.
     safe_sents = F.greatest(sents, F.lit(1.0))
     safe_words = F.greatest(words, F.lit(1.0))
 
-    avg_sent_len = words / safe_sents          # words per sentence
-    avg_syl_word = syls  / safe_words          # syllables per word
+    avg_sent_len = words / safe_sents
+    avg_syl_word = syls / safe_words
 
-    flesch = F.lit(206.835) - F.lit(1.015) * avg_sent_len - F.lit(84.6) * avg_syl_word
-    kandel = F.lit(207.0)   - F.lit(1.015) * avg_sent_len - F.lit(73.6) * avg_syl_word
+    flesch_kincaid = (
+        F.lit(0.39) * avg_sent_len
+        + F.lit(11.8) * avg_syl_word
+        - F.lit(15.59)
+    )
 
-    score  = F.when(F.col("language") == "fr", kandel).otherwise(flesch)
-    index  = F.when(F.col("language") == "fr", F.lit("Kandel-Moles")).otherwise(F.lit("Flesch-Kincaid"))
+    kandel = (
+        F.lit(207.0)
+        - F.lit(1.015) * avg_sent_len
+        - F.lit(73.6) * avg_syl_word
+    )
+
+    score = (
+        F.when(F.col("language") == "fr", kandel)
+         .otherwise(flesch_kincaid)
+    )
+
+    index = (
+        F.when(F.col("language") == "fr", F.lit("Kandel-Moles"))
+         .otherwise(F.lit("Flesch-Kincaid Grade Level"))
+    )
 
     return (
         agg_df
@@ -232,11 +265,17 @@ def compute_global_readability(token_df: DataFrame) -> DataFrame:
         _readability_from_agg(doc_stats)
         .withColumn(
             "avg_sentence_length",
-            (F.col("word_count") / F.greatest(F.col("sentence_count"), F.lit(1))).cast("double"),
+            (
+                F.col("word_count")
+                / F.greatest(F.col("sentence_count"), F.lit(1))
+            ).cast("double"),
         )
         .withColumn(
             "avg_syllables_per_word",
-            (F.col("syllable_count") / F.greatest(F.col("word_count"), F.lit(1))).cast("double"),
+            (
+                F.col("syllable_count")
+                / F.greatest(F.col("word_count"), F.lit(1))
+            ).cast("double"),
         )
         .orderBy("author", "document_id")
     )
@@ -253,9 +292,9 @@ def compute_sliding_readability(
     """
     Compute readability over sliding windows of chunks.
 
-    For each document, chunk_id acts as the position axis (each chunk ~4000
-    chars).  A window of size W centred on chunk c aggregates chunks
-    [c - W//2, c + W//2].
+    For each document, chunk_id acts as the position axis.
+    Each chunk is approximately 4,000 characters. A window of size W centred
+    on chunk c aggregates chunks [c - W//2, c + W//2].
 
     Uses Spark's rangeBetween window function — pure Spark, no collect().
 
@@ -281,7 +320,7 @@ def compute_sliding_readability(
 
         windowed = (
             chunk_stats
-            .withColumn("word_count",     F.sum("word_count").over(doc_window))
+            .withColumn("word_count", F.sum("word_count").over(doc_window))
             .withColumn("syllable_count", F.sum("syllable_count").over(doc_window))
             .withColumn("sentence_count", F.sum("sentence_count").over(doc_window))
             .withColumn("window_size", F.lit(w))
@@ -318,15 +357,15 @@ def save_readability(df: DataFrame, output_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Convenience entry point (called from run_all.py or standalone)
+# Convenience entry point
 # ---------------------------------------------------------------------------
 
 def compute_and_save_readability(
     spark: SparkSession,
     annotated_dir: str = "DATA/processed/corpus_annotated",
-    global_out:    str = "DATA/processed/readability_global",
-    sliding_out:   str = "DATA/processed/readability_sliding",
-    window_sizes:  List[int] = (5, 10, 20),
+    global_out: str = "DATA/processed/readability_global",
+    sliding_out: str = "DATA/processed/readability_sliding",
+    window_sizes: List[int] = (5, 10, 20),
 ) -> None:
     """
     Full readability pipeline:
@@ -339,16 +378,19 @@ def compute_and_save_readability(
     token_df = spark.read.parquet(annotated_dir).cache()
     print(f"[readability] Token rows: {token_df.count()}")
 
-    print("[readability] Computing global readability scores...")
-    global_df = compute_global_readability(token_df)
-    global_df.show(20, truncate=False)
-    save_readability(global_df, global_out)
-    print(f"[readability] Global scores saved to {global_out}")
+    try:
+        print("[readability] Computing global readability scores...")
+        global_df = compute_global_readability(token_df)
+        global_df.show(20, truncate=False)
+        save_readability(global_df, global_out)
+        print(f"[readability] Global scores saved to {global_out}")
 
-    print(f"[readability] Computing sliding readability (windows={list(window_sizes)})...")
-    sliding_df = compute_sliding_readability(token_df, window_sizes=window_sizes)
-    save_readability(sliding_df, sliding_out)
-    print(f"[readability] Sliding scores saved to {sliding_out}")
+        print(f"[readability] Computing sliding readability (windows={list(window_sizes)})...")
+        sliding_df = compute_sliding_readability(token_df, window_sizes=window_sizes)
+        save_readability(sliding_df, sliding_out)
+        print(f"[readability] Sliding scores saved to {sliding_out}")
 
-    token_df.unpersist()
+    finally:
+        token_df.unpersist()
+
     print("[readability] Done.")

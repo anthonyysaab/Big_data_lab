@@ -1,20 +1,44 @@
+"""
+src/ingest.py
+=============
+Load the raw literary corpus into Spark.
+
+Input layout
+------------
+DATA/raw/{author}/{title}.txt
+
+Output schema
+-------------
+raw_text, source_path, author, filename, document_id, language, era
+
+Language is assigned mostly by author, with document-level overrides when an
+author has mixed-language files.
+"""
+
 from pathlib import Path
 
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.types import StructField, StringType, StructType
 
+
+# ---------------------------------------------------------------------------
+# Metadata maps
+# ---------------------------------------------------------------------------
 
 LANGUAGE_MAP = {
-    "balzac": "fr",
-    "dumas": "fr",
+    "balzac": "en",
+    "dumas": "en",
     "stendhal": "fr",
-    "hugo": "fr",
-    "sand": "en",      # Current Indiana file is the English translation.
-    "flaubert": "fr",
-    "zola": "fr",
+    "hugo": "en",
+    "sand": "en",       # Current Indiana file is the English translation.
+    "flaubert": "en",
+    "zola": "en",       # Default for Zola; Nana is overridden below.
     "dickens": "en",
 }
 
+DOCUMENT_LANGUAGE_OVERRIDES = {
+    ("zola", "nana"): "fr",
+}
 
 ERA_MAP = {
     "balzac": "romantic",
@@ -41,6 +65,32 @@ SCHEMA = StructType(
 )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_language(author: str, document_id: str) -> str:
+    """
+    Return the correct language for a document.
+
+    Most documents use the author-level language map. Mixed-language cases
+    are handled with DOCUMENT_LANGUAGE_OVERRIDES.
+    """
+    key = (author, document_id)
+
+    if key in DOCUMENT_LANGUAGE_OVERRIDES:
+        return DOCUMENT_LANGUAGE_OVERRIDES[key]
+
+    if author not in LANGUAGE_MAP:
+        raise ValueError(f"Missing language mapping for author: {author}")
+
+    return LANGUAGE_MAP[author]
+
+
+# ---------------------------------------------------------------------------
+# Main loading function
+# ---------------------------------------------------------------------------
+
 def load_text_corpus(spark: SparkSession, data_dir: str = "DATA/raw") -> DataFrame:
     """
     Load all .txt files from DATA/raw into a Spark DataFrame.
@@ -65,9 +115,6 @@ def load_text_corpus(spark: SparkSession, data_dir: str = "DATA/raw") -> DataFra
         source_path = str(path.resolve())
         raw_text = path.read_text(encoding="utf-8")
 
-        if author not in LANGUAGE_MAP:
-            raise ValueError(f"Missing language mapping for author: {author}")
-
         if author not in ERA_MAP:
             raise ValueError(f"Missing era mapping for author: {author}")
 
@@ -78,7 +125,7 @@ def load_text_corpus(spark: SparkSession, data_dir: str = "DATA/raw") -> DataFra
                 "author": author,
                 "filename": filename,
                 "document_id": document_id,
-                "language": LANGUAGE_MAP[author],
+                "language": get_language(author, document_id),
                 "era": ERA_MAP[author],
             }
         )
@@ -86,11 +133,15 @@ def load_text_corpus(spark: SparkSession, data_dir: str = "DATA/raw") -> DataFra
     return spark.createDataFrame(rows, schema=SCHEMA)
 
 
+# ---------------------------------------------------------------------------
+# Save helper
+# ---------------------------------------------------------------------------
+
 def save_corpus(df: DataFrame, output_dir: str, fmt: str = "parquet") -> None:
     """
     Save corpus as Parquet or ORC, partitioned by author.
 
-    Unlike the older version, this writes exactly to output_dir.
+    This writes exactly to output_dir.
     It does not append _parquet or _orc automatically.
     """
     fmt = fmt.lower()
