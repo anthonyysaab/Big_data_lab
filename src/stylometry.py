@@ -518,23 +518,43 @@ _POS_OF_INTEREST = {
     "RB", "RBR", "RBS",
 }
 
+# Normalise PTB tags to UD-style labels for cross-language comparison.
 _PTB_TO_UD = {
+    # Nom
     "NN": "NOUN",
     "NNS": "NOUN",
     "NNP": "PROPN",
     "NNPS": "PROPN",
+    # Verbes
     "VB": "VERB",
     "VBD": "VERB",
     "VBG": "VERB",
     "VBN": "VERB",
     "VBP": "VERB",
     "VBZ": "VERB",
+    # Adjectifs
     "JJ": "ADJ",
     "JJR": "ADJ",
     "JJS": "ADJ",
+    # Adverbes
     "RB": "ADV",
     "RBR": "ADV",
     "RBS": "ADV",
+    # Determinants
+    "DT": "DET",
+    "PDT": "DET",
+    "WDT": "DET",
+    # Ponctuation
+    ".": "PUNCT",
+    ",": "PUNCT",
+    ":": "PUNCT",
+    ";": "PUNCT",
+    "''": "PUNCT",
+    "``": "PUNCT",
+    "-LRB-": "PUNCT",
+    "-RRB-": "PUNCT",
+    "HYPH": "PUNCT",
+    "NFP": "PUNCT",
 }
 
 
