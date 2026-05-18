@@ -11,6 +11,7 @@ format:
     toc-depth: 3
     number-sections: true
     theme: cosmo
+    html-math-method: mathml
     embed-resources: true
     code-fold: true
     code-summary: "Show code"
@@ -364,6 +365,8 @@ The main optimisation strategy was to avoid recomputing expensive stages. The pr
 | Author-level comparisons | Outputs are written with `partitionBy(author)` | Later author-level analyses can benefit from partition pruning |
 | Expensive visualisation from millions of rows | Spark writes reduced analytical tables before Quarto loads anything | The Quarto report uses Pandas only on small Parquet outputs, not on the full token table |
 
+The most decisive optimisation was the durable Parquet checkpoint. Rerunning readability and stylometry from corpus_annotated took under 5 minutes each, while the full annotation pipeline runs for approximately 45–60 minutes on this hardware. In-memory .cache() provided an additional speedup within individual scripts by avoiding repeated Parquet reads across multiple aggregations.
+
 This strategy is more important than keeping everything in memory. On a local Windows machine, Spark NLP annotation creates the highest JVM pressure, so durable Parquet checkpoints make the workflow more stable and easier to rerun.
 
 The readability run first caches the annotated token table, then computes global readability and sliding-window readability. The global readability stage aggregates token-level rows into one row per document. The sliding readability stage first creates per-chunk statistics, caches them, and reuses them for 5-, 10-, and 20-chunk windows.
@@ -434,8 +437,19 @@ The corpus spans **3.5 million tokens** across 18 novels. Hugo's *Les Misérable
 
 Readability is computed using formulas adapted to the corpus languages:
 
-- **Flesch-Kincaid Grade Level** for English texts: $0.39 \cdot \frac{W}{S} + 11.8 \cdot \frac{Syl}{W} - 15.59$
-- **Kandel-Moles** for French texts: $207.0 - 1.015 \cdot \frac{W}{S} - 73.6 \cdot \frac{Syl}{W}$
+- **Flesch-Kincaid Grade Level** for English texts: 
+
+$$
+0.39 \cdot \frac{W}{S} + 11.8 \cdot \frac{Syl}{W} - 15.59
+$$
+
+- **Kandel-Moles** for French texts: 
+
+$$
+207.0 - 1.015 \cdot \frac{W}{S} - 73.6 \cdot \frac{Syl}{W}
+$$
+
+Here, $W$ is the number of words, $S$ the number of sentences, and $Syl$ the estimated number of syllables.
 
 These two indices are not on the same scale. Flesch-Kincaid is a grade-level difficulty score: higher values indicate a higher estimated reading grade level. Kandel-Moles is an ease score for French: higher values indicate easier texts. They are therefore interpreted within language group rather than as one universal cross-language scale.
 
@@ -466,9 +480,10 @@ fig = px.bar(
                 "avg_syllables_per_word"],
     text="score_label",
 )
-fig.update_traces(textposition="outside")
+fig.update_traces(textposition="inside", textfont_size=11, cliponaxis=False)
 fig.update_xaxes(matches=None)
 fig.update_yaxes(matches=None)
+fig.update_layout(height=650, margin=dict(l=120, r=40, t=80, b=60))
 fig.show()
 
 readability_table = (
@@ -500,7 +515,6 @@ fig = px.scatter(
     color="era",
     color_discrete_map=ERA_COLOURS,
     size="word_count",
-    text="document_id",
     labels={
         "avg_sentence_length":    "Avg words per sentence",
         "avg_syllables_per_word": "Avg syllables per word",
@@ -509,7 +523,6 @@ fig = px.scatter(
     title="Sentence length vs syllabic density (bubble = corpus size)",
     hover_data=["Author", "language", "readability_index", "readability_score"],
 )
-fig.update_traces(textposition="top center")
 fig.show()
 ```
 
@@ -518,8 +531,12 @@ fig.show()
 **Observations:**
 
 - Among English texts, Zola's translated *Germinal*, Balzac's *La Cousine Bette*, and Sand's *Indiana* receive the highest Flesch-Kincaid Grade Level values, reflecting longer sentences and/or higher syllabic density.
+
 - Among French texts, Stendhal's *La Chartreuse de Parme* receives the lowest Kandel-Moles score, mainly because of its high syllabic density.
+
 - Sentence complexity varies more by author and document than by era alone, so readability should not be interpreted as a simple Romantic-vs-Realist divide.
+
+- Readability does not map cleanly onto the Romantic/Realist divide: the three highest Flesch-Kincaid scores (Germinal 13.1, La Cousine Bette 12.8, Indiana 12.25) span both literary periods, suggesting that syntactic complexity is driven by individual authorial register more than by era.
 
 ## Readability across chunks: sliding window
 
@@ -546,6 +563,8 @@ fig = px.line(
     },
     title="Sliding readability for three English-language representative novels",
 )
+fig.update_yaxes(range=[4, 18])
+fig.update_layout(height=600)
 fig.show()
 
 window_summary = (
@@ -637,12 +656,19 @@ for era, grp in ttr.groupby("era"):
     fig.add_trace(
         go.Scatter(
             x=grp["total_tokens"], y=grp["ttr"],
-            mode="markers+text",
-            text=grp["Author"],
-            textposition="top center",
+            mode="markers",
+            text=grp["document_id"],
             name=era.capitalize(),
             marker=dict(color=colour, size=10),
             legendgroup=era, showlegend=False,
+            customdata=grp[["Author", "era"]],
+            hovertemplate=(
+                "Document=%{text}<br>"
+                "Author=%{customdata[0]}<br>"
+                "Era=%{customdata[1]}<br>"
+                "Total tokens=%{x}<br>"
+                "TTR=%{y:.3f}<extra></extra>"
+            ),
         ),
         row=1, col=2,
     )
@@ -650,6 +676,8 @@ for era, grp in ttr.groupby("era"):
 fig.update_layout(
     title_text="Type-Token Ratio: lexical diversity across the corpus",
     barmode="group",
+    height=600,
+    margin=dict(l=70, r=40, t=90, b=140),
 )
 fig.update_xaxes(tickangle=45, row=1, col=1)
 fig.update_xaxes(title_text="Total tokens", row=1, col=2)
@@ -662,9 +690,11 @@ fig.show()
 
 **Observations:**
 
-- Shorter novels such as Balzac's *Eugénie Grandet* and Zola's *L'Assommoir* show higher TTR partly because they repeat fewer words.
-- Among long novels, Hugo's *Les Misérables* retains a high absolute vocabulary size with more than 24,000 unique lemmas.
-- Dickens's TTR appears low because all three Dickens novels are long; his absolute unique lemma counts remain high in the corpus.
+- TTR decreases with document length, as expected: La Chartreuse de Parme (53k tokens, French) shows the highest TTR in the corpus, while Le Comte de Monte-Cristo (536k tokens) shows the lowest.
+
+- This length effect dominates cross-author comparisons and limits their interpretability. TTR should be read within length brackets rather than as an absolute ranking.
+
+- Hugo's Les Misérables is notable among long novels: despite 656k tokens, it retains over 24,000 unique lemmas, more than any Dickens novel of comparable length.
 
 ---
 
@@ -728,14 +758,16 @@ fig.show()
 **Observations:**
 
 - Nouns dominate all authors, as expected in 19th-century literary prose.
-- Zola and Flaubert show relatively high adjective ratios, consistent with Realist attention to sensory description.
+
+- Zola and Flaubert show slightly elevated adjective ratios, consistent with the Realist program of sensory precision. The difference is modest, a few percentage points, which cautions against overstating it: the gap between Romantic and Realist adjective use is one of degree, not kind.
+
 - Stendhal's proper-noun ratio reflects his dense cast of names and political references.
 
 ---
 
 # Dialog vs Narration
 
-Dialog was detected using straight quotation marks, curly English quotation marks, French guillemets, and Gutenberg-style dash dialogue markers such as `--`, `--Text`, `:--`, `—`, `–`, and `―`. The dash-based part remains approximate because it is applied after tokenisation, but it captures the main dialogue conventions observed in the source files.
+Dialog was detected using straight quotation marks, curly English quotation marks, French guillemets, and Gutenberg-style dash dialogue markers such as `--`, `--Text`, `:--`, `—`, `–`, and `―` (i.e. quotation marks, French guillemets, double hyphens, and long dashes). The dash-based part remains approximate because it is applied after tokenisation, but it captures the main dialogue conventions observed in the source files.
 
 ```{python}
 #| label: dialog
@@ -765,10 +797,11 @@ fig.show()
 
 **Observations:**
 
-- Zola's *L'Assommoir*, Flaubert's *L'Éducation sentimentale*, Balzac's *Eugénie Grandet*, and Sand's *Indiana* show the highest detected dialog ratios.
-- Stendhal's two French novels and Zola's *Nana* now show non-zero detected dialog ratios because the method includes double-hyphen and dash-style dialogue markers.
-- Some English novels still show very low values, especially where quotation marks are not tokenised as standalone markers or where dialogue formatting is lost during chunking.
-- This limitation is methodological: dialog detection works best when punctuation markers survive as explicit tokens in the annotated corpus.
+- *L'Assommoir* leads with 52%, followed by *Eugénie Grandet* (44%) and *L'Éducation sentimentale* (41%). These high ratios suggest texts where social interaction and direct speech carry much of the narrative movement.
+
+- Among Realist works, the contrast between *L'Assommoir* and *Germinal* is especially informative: Zola's translated *L'Assommoir* is highly dialogue-driven, while *Germinal* reaches only 4.8%, consistent with a more collective and descriptive narrative structure.
+
+- The main remaining limitation is that dash-based detection is applied after tokenisation. Dash markers fused with adjacent words during tokenisation may be missed. A more robust approach would detect dialogue spans from the cleaned text before chunking.
 
 ---
 
