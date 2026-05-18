@@ -204,15 +204,27 @@ def compute_dialog(token_df: DataFrame) -> DataFrame:
         # Quotation markers.
         .withColumn(
             "_is_open_quote",
-            F.when(F.array_contains(open_set, F.col("token")), F.lit(1)).otherwise(F.lit(0)),
+            F.when(
+                F.array_contains(open_set, F.col("token"))
+                | F.col("token").rlike(r'[«\u201c]'),
+                F.lit(1)
+            ).otherwise(F.lit(0)),
         )
         .withColumn(
             "_is_close_quote",
-            F.when(F.array_contains(close_set, F.col("token")), F.lit(1)).otherwise(F.lit(0)),
+            F.when(
+                F.array_contains(close_set, F.col("token"))
+                | F.col("token").rlike(r'[»\u201d]'),
+                F.lit(1)
+            ).otherwise(F.lit(0)),
         )
         .withColumn(
             "_is_toggle_quote",
-            F.when(F.array_contains(toggle_set, F.col("token")), F.lit(1)).otherwise(F.lit(0)),
+            F.when(
+                F.array_contains(toggle_set, F.col("token"))
+                | F.col("token").rlike(r'^".|."$'),
+                F.lit(1)
+            ).otherwise(F.lit(0)),
         )
         .withColumn(
             "_quote_delta",
